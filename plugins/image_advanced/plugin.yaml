@@ -1,0 +1,4 @@
+name: image_advanced
+version: 0.1.0
+description: "Advanced image workflow tool: generate, edit, and compose with explicit model selection, style/quality profiles, and generation metadata."
+author: NousResearch + Max spec

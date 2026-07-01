@@ -298,7 +298,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_HOME_CHANNEL_NAME", "MATTERMOST_REPLY_MODE",
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
     "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD", "MATRIX_DM_AUTO_THREAD",
-    "MATRIX_RECOVERY_KEY",
+    "MATRIX_READ_ONLY_ROOMS", "MATRIX_PRESENCE_LOG_ROOM_ID", "MATRIX_RECOVERY_KEY",
     # Langfuse observability plugin — optional tuning keys + standard SDK vars.
     # Activation is via plugins.enabled (opt-in through `hermes plugins enable
     # observability/langfuse` or `hermes tools → Langfuse`); credentials gate
@@ -2569,6 +2569,8 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in rooms
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
+        "read_only_rooms": "",         # If set, bot observes these room IDs but never replies
+        "dm_auto_thread": False,        # Auto-create threads for DM messages
     },
 
     # Approval mode for dangerous commands:
@@ -4298,6 +4300,22 @@ OPTIONAL_ENV_VARS = {
     "MATRIX_DM_AUTO_THREAD": {
         "description": "Auto-create threads for DM messages in Matrix (default: false)",
         "prompt": "Auto-create threads in DMs (true/false)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "MATRIX_READ_ONLY_ROOMS": {
+        "description": "Comma-separated Matrix room IDs to observe silently without replies",
+        "prompt": "Matrix read-only room IDs",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "MATRIX_PRESENCE_LOG_ROOM_ID": {
+        "description": "Matrix room ID for mirrored presence/status log messages",
+        "prompt": "Matrix presence log room ID",
         "url": None,
         "password": False,
         "category": "messaging",
