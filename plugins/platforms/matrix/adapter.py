@@ -38,6 +38,7 @@ Environment variables:
                               Allow Matrix room creation tool execution (default: false)
     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
+    MATRIX_READ_ONLY_ROOMS      Comma-separated room IDs to observe silently without replies
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
     MATRIX_ALLOW_PUBLIC_ROOMS   Allow Matrix tools to create public rooms (default: false)
@@ -901,6 +902,19 @@ class MatrixAdapter(BasePlatformAdapter):
             self._allowed_rooms: Set[str] = {
                 r.strip() for r in str(allowed_rooms_raw).split(",") if r.strip()
             }
+        # Read-only rooms are observed but never answered, even when mentioned,
+        # in free-response mode, or inside a bot-participated thread.
+        read_only_rooms_raw = config.extra.get("read_only_rooms")
+        if read_only_rooms_raw is None:
+            read_only_rooms_raw = os.getenv("MATRIX_READ_ONLY_ROOMS", "")
+        if isinstance(read_only_rooms_raw, list):
+            self._read_only_rooms: Set[str] = {
+                str(r).strip() for r in read_only_rooms_raw if str(r).strip()
+            }
+        else:
+            self._read_only_rooms: Set[str] = {
+                r.strip() for r in str(read_only_rooms_raw).split(",") if r.strip()
+            }
         self._allow_room_mentions: bool = os.getenv(
             "MATRIX_ALLOW_ROOM_MENTIONS", "false"
         ).lower() in ("true", "1", "yes")
@@ -1703,6 +1717,7 @@ class MatrixAdapter(BasePlatformAdapter):
             "policy": {
                 "allowed_user_count": len(self._allowed_user_ids),
                 "allowed_room_count": len(self._allowed_room_ids),
+                "read_only_room_count": len(self._read_only_rooms),
                 "ignored_user_pattern_count": len(self._ignored_user_patterns),
                 "require_mention": self._require_mention,
                 "free_response_room_count": len(self._free_rooms),
@@ -2695,6 +2710,15 @@ class MatrixAdapter(BasePlatformAdapter):
         Returns (body, is_dm, chat_type, thread_id, display_name, source)
         or None if the message should be dropped (mention gating).
         """
+        if room_id in self._read_only_rooms:
+            logger.debug(
+                "Matrix: ignoring message %s in %s — room is configured read-only",
+                event_id,
+                room_id,
+            )
+            self._background_read_receipt(room_id, event_id)
+            return None
+
         identity = await self._resolve_room_identity(room_id)
         is_dm = await self._is_dm_room(room_id)
         chat_type = "dm" if is_dm else "group"
@@ -4677,6 +4701,11 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         if isinstance(ar, list):
             ar = ",".join(str(v) for v in ar)
         os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
+    ro = matrix_cfg.get("read_only_rooms")
+    if ro is not None and not os.getenv("MATRIX_READ_ONLY_ROOMS"):
+        if isinstance(ro, list):
+            ro = ",".join(str(v) for v in ro)
+        os.environ["MATRIX_READ_ONLY_ROOMS"] = str(ro)
     ignore_patterns = matrix_cfg.get("ignore_user_patterns")
     if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
         if isinstance(ignore_patterns, list):
@@ -4688,6 +4717,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
     if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
+    if "dm_auto_thread" in matrix_cfg and not os.getenv("MATRIX_DM_AUTO_THREAD"):
+        os.environ["MATRIX_DM_AUTO_THREAD"] = str(matrix_cfg["dm_auto_thread"]).lower()
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     return None
