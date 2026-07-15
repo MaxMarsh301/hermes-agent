@@ -82,3 +82,18 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_consumed_oneshot_is_not_due_after_simulated_restart(temp_home):
+    """Crash after a remote accept cannot cause a fresh agent execution."""
+    from cron.jobs import consume_one_shot_for_run, create_job, get_due_jobs, get_job
+
+    job = create_job(prompt="x", schedule="30m", name="once")
+    # This is the write performed before the agent/network path starts.
+    assert consume_one_shot_for_run(job["id"]) is True
+    # A restarted scheduler re-reads jobs.json and sees no runnable one-shot.
+    assert job["id"] not in {candidate["id"] for candidate in get_due_jobs()}
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored["state"] == "consumed"
+    assert stored["enabled"] is False

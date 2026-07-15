@@ -283,6 +283,19 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
+    # ANTON provenance is accepted only when the authenticated API-server path
+    # has bound its private contextvar; it is never read from user env/body.
+    try:
+        from hermes_plugins.anton_gateway.origin_context import get as _trusted_anton_origin
+        trusted = _trusted_anton_origin()
+        if trusted is not None:
+            return {"platform": "anton", "chat_id": trusted.origin_conversation_id,
+                    "origin_reference": trusted.origin_reference,
+                    "hermes_session_id": trusted.hermes_session_id,
+                    "schedule_id": trusted.schedule_id, "execution_id": trusted.execution_id,
+                    "delivery_target": trusted.delivery_target}
+    except ImportError:
+        pass
     from gateway.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
@@ -525,6 +538,84 @@ def _validate_cron_base_url(
     )
 
 
+_ANTON_CANONICAL_TARGET_RE = re.compile(r"^anton:conversation_[0-9a-f]{32}$")
+_ANTON_DELIVERY_COMPONENT_RE = re.compile(r"^anton(?::|$)", re.IGNORECASE)
+
+
+def _validate_anton_single_delivery_target(deliver: Optional[str]) -> Optional[str]:
+    """Reject fan-out or mixed delivery specifications containing ANTON.
+
+    ANTON cron delivery is deliberately conversation-scoped. List-valued tool
+    arguments are flattened to commas before this point, so a generic fan-out
+    cannot turn ``[\"telegram:1\", \"anton:...\"]`` into a mixed target.
+    """
+    if deliver is None:
+        return None
+    components = deliver.split(",")
+    if any(_ANTON_DELIVERY_COMPONENT_RE.match(component.strip()) for component in components):
+        if len(components) != 1 or not components[0].strip():
+            raise ValueError(
+                "ANTON delivery must be a single target; fan-out or mixed delivery is not allowed"
+            )
+    return deliver
+
+
+def _normalize_anton_delivery_target(deliver: Optional[str]) -> Optional[str]:
+    """Resolve an ANTON delivery reference to its canonical conversation target.
+
+    Canonical conversation targets are already safe to persist and intentionally
+    avoid a resolver round trip. Human references are resolved through the
+    installed gateway client; only a resolved conversation/message whose
+    canonical reference agrees with explicit parents is usable.
+    """
+    _validate_anton_single_delivery_target(deliver)
+    if deliver is None or not deliver.startswith("anton:"):
+        return deliver
+    if _ANTON_CANONICAL_TARGET_RE.fullmatch(deliver):
+        return deliver
+
+    try:
+        from hermes_plugins.anton_gateway.client import AntonGatewayClient
+        from hermes_plugins.anton_gateway.config import AntonConfig
+        from hermes_plugins.anton_gateway.references import parse_human_reference
+        from model_tools import _run_async
+
+        requested = parse_human_reference(deliver)
+        if not requested["conversation_id"]:
+            raise ValueError("ANTON project-only reference cannot be a delivery target")
+        response = _run_async(
+            AntonGatewayClient(AntonConfig.from_env()).resolve(
+                {"reference": deliver, "options": {}}
+            )
+        )
+        if not isinstance(response, dict):
+            raise ValueError("invalid resolver response")
+        if response.get("status") != "resolved":
+            raise ValueError("ANTON reference was not resolved")
+        if response.get("entityFound") is not True:
+            raise ValueError("ANTON reference was not found")
+        resource_type = str(response.get("resourceType") or "").lower()
+        canonical_reference = response.get("canonicalReference")
+        if resource_type not in {"conversation", "message"} or not isinstance(canonical_reference, str):
+            raise ValueError("ANTON reference did not resolve to a conversation or message")
+        canonical = parse_human_reference(canonical_reference)
+        if canonical["project_id"] != requested["project_id"]:
+            raise ValueError("ANTON resolver parent mismatch")
+        if requested["conversation_id"] and canonical["conversation_id"] != requested["conversation_id"]:
+            raise ValueError("ANTON resolver parent mismatch")
+        if requested["message_id"] and canonical["message_id"] != requested["message_id"]:
+            raise ValueError("ANTON resolver parent mismatch")
+        conversation_id = canonical["conversation_id"]
+        if not conversation_id or (resource_type == "message" and not canonical["message_id"]):
+            raise ValueError("ANTON reference did not resolve to a conversation or message")
+        return f"anton:{conversation_id}"
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.warning("ANTON delivery reference resolution failed: %s", exc)
+        raise ValueError("ANTON delivery reference resolution failed") from None
+
+
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
@@ -733,12 +824,17 @@ def cronjob(
                             success=False,
                         )
 
+            normalized_deliver = _normalize_deliver_param(deliver)
+            try:
+                normalized_deliver = _normalize_anton_delivery_target(normalized_deliver)
+            except ValueError as exc:
+                return tool_error(str(exc), success=False)
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
                 name=name,
                 repeat=repeat,
-                deliver=_normalize_deliver_param(deliver),
+                deliver=normalized_deliver,
                 origin=_origin_from_env(),
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
@@ -753,7 +849,7 @@ def cronjob(
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
-            _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
+            _local_notice = _local_delivery_notice(job, normalized_deliver)
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
             return json.dumps(
@@ -864,7 +960,12 @@ def cronjob(
             if name is not None:
                 updates["name"] = name
             if deliver is not None:
-                updates["deliver"] = _normalize_deliver_param(deliver)
+                try:
+                    updates["deliver"] = _normalize_anton_delivery_target(
+                        _normalize_deliver_param(deliver)
+                    )
+                except ValueError as exc:
+                    return tool_error(str(exc), success=False)
             if skills is not None or skill is not None:
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills

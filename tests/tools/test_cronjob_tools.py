@@ -528,6 +528,166 @@ class TestUnifiedCronjobTool:
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
 
+    def _load_anton_plugin(self):
+        """Load the source plugin under the namespace used by runtime plugins."""
+        import importlib.util
+        import sys
+        import types
+        from pathlib import Path
+
+        name = "hermes_plugins.anton_gateway"
+        if name in sys.modules:
+            return sys.modules[name]
+        parent = types.ModuleType("hermes_plugins")
+        parent.__path__ = []
+        sys.modules.setdefault("hermes_plugins", parent)
+        root = Path(__file__).parents[2] / "plugins" / "anton-gateway"
+        spec = importlib.util.spec_from_file_location(
+            name, root / "__init__.py", submodule_search_locations=[str(root)]
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_create_and_update_resolve_anton_human_reference(self, monkeypatch):
+        """Only resolver-confirmed references reach persistence as conversations."""
+        import sys
+
+        plugin = self._load_anton_plugin()
+        client = sys.modules[plugin.__name__ + ".client"]
+        calls = []
+
+        async def resolve(_self, payload):
+            calls.append(payload["reference"])
+            return {
+                "status": "resolved",
+                "entityFound": True,
+                "resourceType": "message",
+                "canonicalReference": (
+                    "anton:project_gateway/"
+                    "conversation_0123456789abcdef0123456789abcdef/"
+                    "message_fedcba9876543210fedcba9876543210"
+                ),
+            }
+
+        monkeypatch.setattr(client.AntonGatewayClient, "resolve", resolve)
+        created = json.loads(cronjob(
+            action="create", prompt="x", schedule="every 1h",
+            deliver="anton:project_gateway/conversation_0123456789abcdef0123456789abcdef",
+        ))
+        assert created["success"] is True
+        assert created["deliver"] == "anton:conversation_0123456789abcdef0123456789abcdef"
+
+        updated = json.loads(cronjob(
+            action="update", job_id=created["job_id"],
+            deliver="anton:project_gateway/conversation_0123456789abcdef0123456789abcdef/message_fedcba9876543210fedcba9876543210",
+        ))
+        assert updated["success"] is True
+        assert updated["job"]["deliver"] == "anton:conversation_0123456789abcdef0123456789abcdef"
+        assert len(calls) == 2
+
+    def test_anton_canonical_target_skips_resolver(self, monkeypatch):
+        plugin = self._load_anton_plugin()
+        import sys
+
+        client = sys.modules[plugin.__name__ + ".client"]
+
+        async def should_not_resolve(*_args, **_kwargs):
+            raise AssertionError("canonical ANTON target must not resolve")
+
+        monkeypatch.setattr(client.AntonGatewayClient, "resolve", should_not_resolve)
+        result = json.loads(cronjob(
+            action="create", prompt="x", schedule="every 1h",
+            deliver="anton:conversation_0123456789abcdef0123456789abcdef",
+        ))
+        assert result["success"] is True
+        assert result["deliver"] == "anton:conversation_0123456789abcdef0123456789abcdef"
+
+    @pytest.mark.parametrize("deliver", [
+        "anton:project_gateway",
+        "anton:project_gateway/conversation_0123456789abcdef0123456789abcdef",
+    ])
+    def test_anton_project_only_and_resolver_errors_are_rejected(self, monkeypatch, deliver):
+        plugin = self._load_anton_plugin()
+        import sys
+
+        client = sys.modules[plugin.__name__ + ".client"]
+
+        async def resolve(_self, _payload):
+            return {"entityFound": False, "canonicalReference": None, "resourceType": None}
+
+        monkeypatch.setattr(client.AntonGatewayClient, "resolve", resolve)
+        result = json.loads(cronjob(action="create", prompt="x", schedule="every 1h", deliver=deliver))
+        assert result["success"] is False
+
+    def test_direct_persistence_calls_cannot_bypass_anton_guard(self):
+        from cron.jobs import create_job, update_job
+
+        canonical = "anton:conversation_0123456789abcdef0123456789abcdef"
+        with pytest.raises(ValueError, match="invalid ANTON delivery target"):
+            create_job(prompt="x", schedule="every 1h", deliver="anton:project_gateway")
+        with pytest.raises(ValueError, match="single target"):
+            create_job(prompt="x", schedule="every 1h", deliver=f"telegram:1,{canonical}")
+        with pytest.raises(ValueError, match="single target"):
+            create_job(prompt="x", schedule="every 1h", deliver=["telegram:1", canonical])  # type: ignore[arg-type]
+        created = create_job(prompt="x", schedule="every 1h")
+        with pytest.raises(ValueError, match="invalid ANTON delivery target"):
+            update_job(created["id"], {"deliver": "anton:project_gateway"})
+        with pytest.raises(ValueError, match="single target"):
+            update_job(created["id"], {"deliver": f"{canonical},telegram:1"})
+
+    @pytest.mark.parametrize("status", [None, "not_found", "parent_mismatch", "Resolved"])
+    def test_anton_resolver_requires_exact_resolved_status(self, monkeypatch, status):
+        """Usable-looking IDs cannot override a non-resolved Gateway outcome."""
+        import sys
+
+        plugin = self._load_anton_plugin()
+        client = sys.modules[plugin.__name__ + ".client"]
+
+        async def resolve(_self, _payload):
+            return {
+                "status": status,
+                "entityFound": True,
+                "resourceType": "conversation",
+                "canonicalReference": (
+                    "anton:project_gateway/"
+                    "conversation_0123456789abcdef0123456789abcdef"
+                ),
+            }
+
+        monkeypatch.setattr(client.AntonGatewayClient, "resolve", resolve)
+        result = json.loads(cronjob(
+            action="create", prompt="x", schedule="every 1h",
+            deliver="anton:project_gateway/conversation_0123456789abcdef0123456789abcdef",
+        ))
+        assert result["success"] is False
+        assert "not resolved" in result["error"]
+
+    @pytest.mark.parametrize("deliver", [
+        "telegram:1,anton:project_gateway/conversation_0123456789abcdef0123456789abcdef",
+        ["telegram:1", "anton:project_gateway/conversation_0123456789abcdef0123456789abcdef"],
+        "anton:conversation_0123456789abcdef0123456789abcdef,telegram:1",
+    ])
+    def test_anton_fanout_is_rejected_before_resolver_network(self, monkeypatch, deliver):
+        import sys
+
+        plugin = self._load_anton_plugin()
+        client = sys.modules[plugin.__name__ + ".client"]
+        calls = []
+
+        async def resolve(*_args, **_kwargs):
+            calls.append(True)
+            raise AssertionError("mixed ANTON delivery must not reach resolver")
+
+        monkeypatch.setattr(client.AntonGatewayClient, "resolve", resolve)
+        result = json.loads(cronjob(
+            action="create", prompt="x", schedule="every 1h", deliver=deliver
+        ))
+        assert result["success"] is False
+        assert "single target" in result["error"]
+        assert calls == []
+
 
 # =========================================================================
 # Per-job model/provider override resolution
@@ -613,7 +773,11 @@ class TestLocalDeliveryNotice:
         assert "local-only cron job" in created["message"]
         assert "deliver='telegram'" in created["message"]
 
-    def test_explicit_origin_no_origin_emits_notice(self):
+    def test_explicit_origin_no_origin_emits_notice(self, monkeypatch):
+        # ``origin`` can fall back to a configured home channel. This test
+        # specifically covers the no-origin/no-fallback case, so isolate it
+        # from developer-machine gateway configuration.
+        monkeypatch.setattr("cron.scheduler._resolve_delivery_targets", lambda _job: [])
         created = json.loads(
             cronjob(
                 action="create", prompt="x", schedule="every 2m", deliver="origin"

@@ -981,6 +981,46 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+_ANTON_CANONICAL_DELIVERY_TARGET_RE = re.compile(r"^anton:conversation_[0-9a-f]{32}$")
+_ANTON_DELIVERY_COMPONENT_RE = re.compile(r"^anton(?::|$)", re.IGNORECASE)
+
+
+def _validate_persisted_anton_delivery(deliver: Any) -> None:
+    """Keep ANTON delivery conversation-scoped at the storage boundary.
+
+    Tool callers normalize list values to comma-separated strings, but direct
+    callers can bypass that boundary. Reject every fan-out/mixed form that
+    names ANTON instead of checking only whether the entire string starts with it.
+    """
+    if isinstance(deliver, str):
+        components = deliver.split(",")
+        anton_components = [
+            component.strip()
+            for component in components
+            if _ANTON_DELIVERY_COMPONENT_RE.match(component.strip())
+        ]
+        if not anton_components:
+            return
+        if len(components) != 1 or len(anton_components) != 1:
+            raise ValueError(
+                "ANTON delivery must be a single target; fan-out or mixed delivery is not allowed"
+            )
+        if not _ANTON_CANONICAL_DELIVERY_TARGET_RE.fullmatch(anton_components[0]):
+            raise ValueError("invalid ANTON delivery target")
+        return
+
+    if isinstance(deliver, (list, tuple)):
+        components = [
+            component.strip()
+            for value in deliver
+            for component in str(value).split(",")
+        ]
+        if any(_ANTON_DELIVERY_COMPONENT_RE.match(component) for component in components):
+            raise ValueError(
+                "ANTON delivery must be a single target; fan-out or mixed delivery is not allowed"
+            )
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1115,6 +1155,10 @@ def create_job(
     # Default delivery to origin if available, otherwise local
     if deliver is None:
         deliver = "origin" if origin else "local"
+
+    # Keep this at the persistence boundary so direct callers cannot bypass the
+    # tool's resolver validation or fan-out restriction.
+    _validate_persisted_anton_delivery(deliver)
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
@@ -1305,6 +1349,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            if "deliver" in updates:
+                _validate_persisted_anton_delivery(updates["deliver"])
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -1690,6 +1737,31 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
+def consume_one_shot_for_run(job_id: str) -> bool:
+    """Durably consume a due one-shot before starting its agent.
+
+    Consumption is terminal rather than a renewable execution lease: after a
+    crash we cannot know whether the agent already caused a remote side effect,
+    so one-shots choose at-most-once execution over a duplicate result.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            if (job.get("schedule", {}).get("kind") != "once"
+                    or not job.get("enabled", True)
+                    or job.get("state") in {"paused", "completed", "consumed"}):
+                return False
+            job["enabled"] = False
+            job["state"] = "consumed"
+            job["next_run_at"] = None
+            job["one_shot_consumed_at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+        return False
+
+
 def _machine_id() -> str:
     """Stable-ish identifier for claim attribution/debugging (NOT correctness).
 
@@ -1736,6 +1808,18 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
+            kind = job.get("schedule", {}).get("kind")
+            if kind == "once":
+                # An external fire is the execution boundary for a one-shot.
+                # Do not use a TTL lease: a crashed worker may already have
+                # produced an accepted remote delivery.
+                job["enabled"] = False
+                job["state"] = "consumed"
+                job["next_run_at"] = None
+                job["one_shot_consumed_at"] = now.isoformat()
+                job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+                save_jobs(jobs)
+                return True
             existing = job.get("fire_claim")
             if existing:
                 try:

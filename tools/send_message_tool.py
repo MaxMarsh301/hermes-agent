@@ -691,6 +691,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    delivery_context=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -719,6 +720,8 @@ async def _send_via_adapter(
         if adapter is not None:
             try:
                 metadata = {}
+                if delivery_context is not None:
+                    metadata["delivery_context"] = delivery_context
                 if thread_id:
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
@@ -729,10 +732,22 @@ async def _send_via_adapter(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                return {"error": f"Plugin platform send failed: {e}"}
+                # Retain plugin-provided transport classification for durable
+                # callers while preserving the established human error string.
+                return {
+                    "error": f"Plugin platform send failed: {e}",
+                    "code": getattr(e, "code", "plugin_send_failed"),
+                    "retryable": getattr(e, "retryable", None),
+                }
             if result.success:
                 return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
+            raw_response = getattr(result, "raw_response", None)
+            raw_code = raw_response.get("code") if isinstance(raw_response, dict) else None
+            return {
+                "error": f"Adapter send failed: {result.error}",
+                "code": getattr(result, "code", None) or raw_code or "adapter_send_failed",
+                "retryable": getattr(result, "retryable", None),
+            }
 
     entry = None
     try:
@@ -750,12 +765,17 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                **({"delivery_context": delivery_context} if delivery_context is not None else {}),
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.debug("Plugin standalone send for %s raised", platform_name, exc_info=True)
-            return {"error": f"Plugin standalone send failed: {e}"}
+            return {
+                "error": f"Plugin standalone send failed: {e}",
+                "code": getattr(e, "code", "plugin_standalone_send_failed"),
+                "retryable": getattr(e, "retryable", None),
+            }
 
         if isinstance(result, dict) and (result.get("success") or result.get("error")):
             return result

@@ -136,6 +136,19 @@ def test_get_platform_tools_uses_default_when_platform_not_configured():
     assert enabled.isdisjoint(_DEFAULT_OFF_TOOLSETS)
 
 
+def test_anton_gateway_toolset_is_default_off_but_explicitly_enableable(monkeypatch):
+    """The delivery platform remains registered independently of its resolver tool."""
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_plugin_toolset_keys", lambda: {"anton-gateway"}
+    )
+
+    assert "anton-gateway" not in _get_platform_tools({}, "cli")
+    enabled = _get_platform_tools(
+        {"platform_toolsets": {"cli": ["anton-gateway"]}}, "cli"
+    )
+    assert "anton-gateway" in enabled
+
+
 def test_gui_toolset_label_strips_leading_emoji():
     assert gui_toolset_label("🔍 Web Search & Scraping") == "Web Search & Scraping"
     assert gui_toolset_label("👁️  Vision / Image Analysis") == "Vision / Image Analysis"
@@ -1337,9 +1350,25 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
         "_test_platform": {"label": "Test", "default_toolset": "hermes-_test_platform"},
     }
 
+    def resolve_fake_toolset(name, visited=None):
+        visited = set() if visited is None else visited
+        if name in visited or name not in fake_toolsets:
+            return []
+        visited.add(name)
+        definition = fake_toolsets[name]
+        tools = set(definition.get("tools", []))
+        for included in definition.get("includes", []):
+            tools.update(resolve_fake_toolset(included, visited))
+        return sorted(tools)
+
+    # _get_platform_tools also consults plugin discovery and the live tool
+    # registry cache. Keep all of those global states out of this synthetic
+    # TOOLSETS test so its reverse mapping is order-independent.
     with mock_patch("hermes_cli.tools_config.PLATFORMS", {**PLATFORMS, **test_platforms}):
         with mock_patch("toolsets.TOOLSETS", fake_toolsets):
-            enabled = _get_platform_tools({}, "_test_platform")
+            with mock_patch("toolsets.resolve_toolset", side_effect=resolve_fake_toolset):
+                with mock_patch("hermes_cli.tools_config._get_plugin_toolset_keys", return_value=set()):
+                    enabled = _get_platform_tools({}, "_test_platform")
 
     assert "_test_platform_tool" in enabled
     assert "web" in enabled
