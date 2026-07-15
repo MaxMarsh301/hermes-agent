@@ -238,7 +238,10 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run, claim_dispatch, consume_one_shot_for_run, get_due_jobs,
+    heartbeat_run_claim, mark_job_run, save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1219,6 +1222,10 @@ def _expand_routing_tokens(part: str) -> List[str]:
         return [part]
     expanded: List[str] = []
     for platform_name in _iter_home_target_platforms():
+        # ANTON deliveries are durable structured records, not generic chat
+        # fan-out. It may be selected explicitly or as the trusted origin.
+        if platform_name.lower() == "anton":
+            continue
         if _get_home_target_chat_id(platform_name):
             expanded.append(platform_name)
     return expanded
@@ -1413,7 +1420,115 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # Resolve first: an ANTON origin and an explicit anton:conversation target
+    # share one durable path.  ANTON is deliberately not handled by generic
+    # rendering/media fan-out below.
     targets = _resolve_delivery_targets(job)
+    anton_targets = [target for target in targets if target["platform"].lower() == "anton"]
+    if len(targets) == 1 and len(anton_targets) == 1:
+        import asyncio as _asyncio
+        import uuid
+        from datetime import datetime, timezone
+        from agent.async_utils import safe_schedule_threadsafe
+        from cron.delivery_context import CronDeliveryContext
+        from gateway.config import Platform, load_gateway_config
+        from gateway.delivery import DeliveryRouter, DeliveryTarget
+        from gateway.platforms.base import BasePlatformAdapter
+        from hermes_plugins.anton_gateway.client import AntonTransportError
+        from hermes_plugins.anton_gateway.config import MAX_TRANSPORT_TIMEOUT_SECONDS
+        from hermes_plugins.anton_gateway.outbox import AntonOutbox
+        from hermes_plugins.anton_gateway.platform import build_payload
+
+        target = anton_targets[0]
+        if target.get("thread_id") is not None:
+            return "ANTON delivery does not support thread_id"
+        media_files, _ = BasePlatformAdapter.extract_media(content)
+        if media_files:
+            return "ANTON delivery does not support media attachments"
+        delivery_target = f"anton:{target['chat_id']}"
+        execution_id, delivery_id = f"run_{uuid.uuid4().hex}", f"delivery_{uuid.uuid4().hex}"
+        context = CronDeliveryContext(
+            job["id"], execution_id, delivery_id, delivery_target,
+            datetime.now(timezone.utc).isoformat(), job.get("origin"),
+        )
+        payload, _ = build_payload(content, context)
+        outbox = AntonOutbox()
+        # Commit immutable protocol payload and IDs before any network attempt.
+        claimed = outbox.create_and_claim({
+            "deliveryId": delivery_id, "scheduleId": job["id"], "executionId": execution_id,
+            "deliveryTarget": delivery_target, "payload": payload,
+        })
+        lease_token = claimed["leaseToken"]
+        try:
+            platform = Platform("anton")
+            config = load_gateway_config()
+            adapter = (adapters or {}).get(platform)
+            if adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+                router = DeliveryRouter(config, adapters)
+                future = safe_schedule_threadsafe(
+                    router._deliver_to_platform(
+                        DeliveryTarget(platform=platform, chat_id=str(target["chat_id"]), is_explicit=True),
+                        content, {"delivery_context": context},
+                    ), loop,
+                )
+                if future is None:
+                    raise RuntimeError("live adapter event loop scheduling failed")
+                # ANTON permits a 120-second client transport attempt. Give it
+                # an additional cancellation/settlement margin, but finish
+                # before the 180-second fenced outbox lease can be recovered
+                # by another sender.
+                live_wait_timeout = min(
+                    outbox.MIN_LEASE_SECONDS - 1,
+                    MAX_TRANSPORT_TIMEOUT_SECONDS + 30,
+                )
+                try:
+                    result = future.result(timeout=live_wait_timeout)
+                except concurrent.futures.TimeoutError as exc:
+                    # run_coroutine_threadsafe cancellation is propagated to
+                    # the event-loop Task. The immutable record remains owned
+                    # by this lease and is released as a retryable timeout.
+                    future.cancel()
+                    raise AntonTransportError("timeout", retryable=True) from exc
+            else:
+                from tools.send_message_tool import _send_via_adapter
+                result = _asyncio.run(_send_via_adapter(
+                    platform, config.platforms.get(platform), str(target["chat_id"]), content,
+                    delivery_context=context,
+                ))
+            confirmed = result.get("success", False) if isinstance(result, dict) else _confirm_adapter_delivery(result)
+            if not confirmed:
+                if isinstance(result, dict):
+                    code = result.get("code") or "delivery_failed"
+                    retryable = result.get("retryable")
+                else:
+                    raw_response = getattr(result, "raw_response", None)
+                    code = (raw_response.get("code") if isinstance(raw_response, dict) else None) or "delivery_failed"
+                    retryable = getattr(result, "retryable", None)
+                # Unknown plugin/live-adapter failures are transient by default;
+                # the bounded outbox provides the finite retry limit. Explicit
+                # ANTON 4xx/auth/validation classifications remain permanent.
+                if retryable is None or code in {
+                    "delivery_failed", "adapter_send_failed", "plugin_send_failed",
+                    "plugin_standalone_send_failed",
+                }:
+                    retryable = True
+                raise AntonTransportError(str(code), bool(retryable))
+            outbox.transition(
+                delivery_id, expected_token=lease_token,
+                state="delivered", errorCode=None, leaseExpiresAt=None,
+            )
+            return None
+        except Exception as exc:
+            outbox.retry_or_dead_letter(
+                delivery_id, lease_token, getattr(exc, "code", "delivery_failed"),
+                bool(getattr(exc, "retryable", False)),
+            )
+            return f"ANTON delivery pending/failed: {getattr(exc, 'code', 'delivery_failed')}"
+
+    # A mixed target list is not a valid ANTON generic fan-out: never deliver
+    # that target without its durable context/record.
+    if anton_targets:
+        return "ANTON delivery must be the only resolved delivery target"
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -3726,6 +3841,17 @@ def tick(
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+        # Recovery is platform-owned and bounded. It claims durable outbox
+        # records only, so a restart cannot re-run an agent just to retry a
+        # failed network delivery.
+        try:
+            from gateway.platform_registry import platform_registry
+            retry_entry = platform_registry.get("anton")
+            retry_hook = getattr(retry_entry, "cron_retry_due_fn", None)
+            if retry_hook is not None:
+                retry_hook(10)
+        except Exception as exc:
+            logger.warning("Durable cron delivery recovery failed: %s", exc)
 
         due_jobs = get_due_jobs()
 
@@ -3741,8 +3867,19 @@ def tick(
         # For parallel jobs that are already running, advance_next_run keeps
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
+        dispatch_jobs = []
         for job in due_jobs:
-            advance_next_run(job["id"])
+            # A one-shot is irreversibly consumed before its agent begins. If
+            # this process dies after the remote side accepts its result, a
+            # restart must not create a new deliveryId by re-running the agent.
+            schedule = job.get("schedule", {})
+            if isinstance(schedule, dict) and schedule.get("kind") == "once":
+                if consume_one_shot_for_run(job["id"]):
+                    dispatch_jobs.append(job)
+            else:
+                advance_next_run(job["id"])
+                dispatch_jobs.append(job)
+        due_jobs = dispatch_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.

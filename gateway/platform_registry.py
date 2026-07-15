@@ -158,6 +158,10 @@ class PlatformEntry:
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
 
+    # Optional bounded recovery hook for a platform's durable cron outbox.
+    # Scheduler calls it after restart; it must retry persisted deliveries only.
+    cron_retry_due_fn: Optional[Callable[[int], int]] = None
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.

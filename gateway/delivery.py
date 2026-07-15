@@ -396,6 +396,16 @@ class DeliveryRouter:
         
         if not adapter:
             raise ValueError(f"No adapter configured for {target.platform.value}")
+        # ANTON is a structured signed delivery protocol, not a chat renderer.
+        # It deliberately bypasses truncation, MEDIA extraction, silence filtering,
+        # and generic thread routing; its adapter validates immutable context.
+        if target.platform.value == "anton":
+            if target.thread_id is not None:
+                raise ValueError("ANTON does not support thread_id")
+            result = await adapter.send(target.chat_id, content, metadata=dict(metadata or {}))
+            if _send_result_failed(result):
+                raise RuntimeError(_send_result_error(result) or "ANTON delivery failed")
+            return result
         
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")

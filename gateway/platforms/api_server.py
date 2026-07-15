@@ -32,6 +32,8 @@ Requires:
 """
 
 import asyncio
+from collections import OrderedDict
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -105,6 +107,80 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+ANTON_CRON_ORIGIN_MAX_AGE_SECONDS = 300
+ANTON_CRON_ORIGIN_VERSION = "v1"
+# This matches Gateway's outbound byte limit. It applies before JSON parsing
+# whenever a request asks Hermes to trust ANTON provenance.
+ANTON_CRON_ORIGIN_MAX_REQUEST_BYTES = 256 * 1024
+ANTON_CRON_ORIGIN_NONCE_CACHE_MAX = 10_000
+_ANTON_CRON_ORIGIN_SIGNATURE_RE = re.compile(r"sha256=[0-9a-f]{64}\Z")
+_ANTON_CRON_ORIGIN_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
+_anton_cron_origin_nonces = OrderedDict()
+
+
+def _verify_anton_cron_origin_headers(
+    request: "web.Request", body: bytes
+) -> tuple[Optional[str], Optional["web.Response"]]:
+    """Authenticate the optional ANTON cron provenance wire headers.
+
+    The origin JSON is intentionally returned *unparsed*.  Its parser lives in
+    the optional ANTON plugin and must only run after the HMAC, timestamp, and
+    freshness checks succeed.
+    """
+    version = request.headers.get("X-Anton-Cron-Origin-Version")
+    origin_header = request.headers.get("X-Anton-Cron-Origin")
+    timestamp = request.headers.get("X-Anton-Cron-Origin-Timestamp")
+    nonce = request.headers.get("X-Anton-Cron-Origin-Nonce")
+    signature = request.headers.get("X-Anton-Cron-Origin-Signature")
+    supplied = (version is not None, origin_header is not None, timestamp is not None, nonce is not None, signature is not None)
+    if not any(supplied):
+        return None, None
+    if not all(supplied):
+        return None, web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+
+    key = os.getenv("ANTON_CRON_ORIGIN_HMAC_KEY", "")
+    if not key or not version or not origin_header or not timestamp or not nonce or not signature:
+        return None, web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+    if version != ANTON_CRON_ORIGIN_VERSION or not _ANTON_CRON_ORIGIN_NONCE_RE.fullmatch(nonce) or not _ANTON_CRON_ORIGIN_SIGNATURE_RE.fullmatch(signature):
+        return None, web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+
+    if len(body) > ANTON_CRON_ORIGIN_MAX_REQUEST_BYTES:
+        return None, web.json_response(_openai_error("ANTON cron request too large"), status=413)
+    body_digest = hashlib.sha256(body).hexdigest()
+    # Keep this preimage exactly aligned with Gateway ChatRuntime.
+    preimage = "\n".join((version, request.method, request.path, timestamp, nonce, origin_header, body_digest))
+    expected = "sha256=" + hmac.new(
+        key.encode("utf-8"),
+        preimage.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return None, web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+
+    try:
+        parsed_timestamp = datetime.fromisoformat(timestamp)
+        if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        age = (datetime.now(timezone.utc) - parsed_timestamp.astimezone(timezone.utc)).total_seconds()
+        if abs(age) > ANTON_CRON_ORIGIN_MAX_AGE_SECONDS:
+            raise ValueError("timestamp outside accepted clock skew")
+    except (TypeError, ValueError, OverflowError):
+        return None, web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+
+    # Bounded, single-process replay protection. No await occurs in this
+    # check-and-insert sequence, so aiohttp tasks cannot race it.
+    now_monotonic = time.monotonic()
+    while _anton_cron_origin_nonces:
+        _, expiry = next(iter(_anton_cron_origin_nonces.items()))
+        if expiry > now_monotonic:
+            break
+        _anton_cron_origin_nonces.popitem(last=False)
+    if nonce in _anton_cron_origin_nonces:
+        return None, web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+    while len(_anton_cron_origin_nonces) >= ANTON_CRON_ORIGIN_NONCE_CACHE_MAX:
+        _anton_cron_origin_nonces.popitem(last=False)
+    _anton_cron_origin_nonces[nonce] = now_monotonic + ANTON_CRON_ORIGIN_MAX_AGE_SECONDS
+    return origin_header, None
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -4356,9 +4432,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return limited
 
         try:
-            body = await request.json()
+            raw_body = await request.read()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        origin_header, origin_err = _verify_anton_cron_origin_headers(request, raw_body)
+        if origin_err is not None:
+            return origin_err
+
+        try:
+            body = json.loads(raw_body)
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        trusted_anton_origin = None
+        if origin_header is not None:
+            try:
+                from hermes_plugins.anton_gateway.origin_context import parse_origin
+                trusted_anton_origin = parse_origin(json.loads(origin_header))
+            except Exception:
+                return web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
 
         raw_input = body.get("input")
         if not raw_input:
@@ -4530,8 +4623,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     effective_task_id = session_id or run_id
                     approval_token = None
+                    anton_origin_token = None
                     session_tokens = []
                     try:
+                        if trusted_anton_origin is not None:
+                            from hermes_plugins.anton_gateway.origin_context import bind
+                            anton_origin_token = bind(trusted_anton_origin)
                         # Bind approval/session identity for this API run via
                         # contextvars so concurrent runs do not share process
                         # environment state.
@@ -4546,6 +4643,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             task_id=effective_task_id,
                         )
                     finally:
+                        if anton_origin_token is not None:
+                            try:
+                                from hermes_plugins.anton_gateway.origin_context import reset
+                                reset(anton_origin_token)
+                            except Exception:
+                                pass
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:

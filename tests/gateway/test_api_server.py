@@ -13,9 +13,15 @@ Tests cover:
 """
 
 import asyncio
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import json
 import os
 import stat
+import sys
+import types
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -629,6 +635,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     return app
@@ -677,6 +684,162 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+
+# ---------------------------------------------------------------------------
+# /v1/runs ANTON cron origin wire authentication
+# ---------------------------------------------------------------------------
+
+
+def _anton_origin_headers(
+    origin: str, timestamp: str, body: bytes, key: str = "anton-test-key", nonce: str | None = None
+) -> dict:
+    nonce = nonce or uuid.uuid4().hex
+    digest = hashlib.sha256(body).hexdigest()
+    preimage = "\n".join(("v1", "POST", "/v1/runs", timestamp, nonce, origin, digest))
+    signature = "sha256=" + hmac.new(key.encode("utf-8"), preimage.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "X-Anton-Cron-Origin-Version": "v1",
+        "X-Anton-Cron-Origin": origin,
+        "X-Anton-Cron-Origin-Timestamp": timestamp,
+        "X-Anton-Cron-Origin-Nonce": nonce,
+        "X-Anton-Cron-Origin-Signature": signature,
+        "Content-Type": "application/json",
+    }
+
+
+def _install_fake_anton_origin_context(monkeypatch):
+    """Install the optional plugin API without requiring plugin discovery in this test."""
+    current = ContextVar("test_anton_origin", default=None)
+    origin_module = types.ModuleType("hermes_plugins.anton_gateway.origin_context")
+    origin_module.parse_origin = lambda value: value
+    origin_module.bind = current.set
+    origin_module.reset = current.reset
+    origin_module.get = current.get
+    plugins_module = types.ModuleType("hermes_plugins")
+    plugins_module.__path__ = []
+    anton_module = types.ModuleType("hermes_plugins.anton_gateway")
+    anton_module.__path__ = []
+    monkeypatch.setitem(sys.modules, "hermes_plugins", plugins_module)
+    monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway", anton_module)
+    monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway.origin_context", origin_module)
+    return current
+
+
+class TestAntonOriginRuns:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["tampered", "stale", "future", "missing", "malformed"])
+    async def test_anton_origin_rejected_before_parse_or_binding(self, adapter, monkeypatch, kind):
+        monkeypatch.setenv("ANTON_CRON_ORIGIN_HMAC_KEY", "anton-test-key")
+        parsed = False
+        origin = json.dumps({"origin": "anton", "originConversationId": "conversation-1"}, separators=(",", ":"))
+        body = b'{"input":"hello"}'
+        timestamp = datetime.now(timezone.utc).isoformat()
+        headers = _anton_origin_headers(origin, timestamp, body)
+        if kind == "tampered":
+            headers["X-Anton-Cron-Origin"] = origin + " "
+        elif kind == "stale":
+            timestamp = (datetime.now(timezone.utc) - timedelta(seconds=301)).isoformat()
+            headers = _anton_origin_headers(origin, timestamp, body)
+        elif kind == "future":
+            timestamp = (datetime.now(timezone.utc) + timedelta(seconds=301)).isoformat()
+            headers = _anton_origin_headers(origin, timestamp, body)
+        elif kind == "missing":
+            del headers["X-Anton-Cron-Origin-Timestamp"]
+        else:
+            headers["X-Anton-Cron-Origin-Signature"] = "sha256=" + "A" * 64
+
+        origin_module = types.ModuleType("hermes_plugins.anton_gateway.origin_context")
+
+        def _parse_should_not_run(value):
+            nonlocal parsed
+            parsed = True
+            return value
+
+        origin_module.parse_origin = _parse_should_not_run
+        plugins_module = types.ModuleType("hermes_plugins")
+        plugins_module.__path__ = []
+        anton_module = types.ModuleType("hermes_plugins.anton_gateway")
+        anton_module.__path__ = []
+        monkeypatch.setitem(sys.modules, "hermes_plugins", plugins_module)
+        monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway", anton_module)
+        monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway.origin_context", origin_module)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs", headers=headers, data=body)
+        assert response.status == 403
+        assert parsed is False
+
+    @pytest.mark.asyncio
+    async def test_anton_origin_valid_binds_then_resets_without_leak(self, adapter, monkeypatch):
+        monkeypatch.setenv("ANTON_CRON_ORIGIN_HMAC_KEY", "anton-test-key")
+        origin_context = _install_fake_anton_origin_context(monkeypatch)
+        origin = {"origin": "anton", "originConversationId": "conversation-1"}
+        origin_header = json.dumps(origin, separators=(",", ":"))
+        first_body = b'{"input":"first"}'
+        headers = _anton_origin_headers(origin_header, datetime.now(timezone.utc).isoformat(), first_body)
+        observed = []
+
+        def _make_agent():
+            agent = MagicMock()
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+
+            def _run(**_):
+                from gateway.session_context import async_delivery_supported, get_session_env
+                observed.append((origin_context.get(), get_session_env("HERMES_SESSION_PLATFORM"), async_delivery_supported()))
+                return {"final_response": "ok"}
+
+            agent.run_conversation.side_effect = _run
+            return agent
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=lambda **_: _make_agent()):
+                response = await cli.post("/v1/runs", headers=headers, data=first_body)
+                assert response.status == 202
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                response = await cli.post("/v1/runs", json={"input": "second"})
+                assert response.status == 202
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+
+        assert observed == [(origin, "api_server", False), (None, "api_server", False)]
+        assert origin_context.get() is None
+
+    @pytest.mark.asyncio
+    async def test_anton_origin_rejects_captured_headers_on_changed_body_or_replay(self, adapter, monkeypatch):
+        monkeypatch.setenv("ANTON_CRON_ORIGIN_HMAC_KEY", "anton-test-key")
+        _install_fake_anton_origin_context(monkeypatch)
+        origin = json.dumps({"origin": "anton", "originConversationId": "conversation-1"}, separators=(",", ":"))
+        captured_body = b'{"input":"captured"}'
+        headers = _anton_origin_headers(origin, datetime.now(timezone.utc).isoformat(), captured_body)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # A captured envelope does not authenticate a changed raw body.
+            changed = await cli.post("/v1/runs", headers=headers, data=b'{"input":"changed"}')
+            assert changed.status == 403
+
+            # Its first exact use is accepted; its second exact use is replay.
+            with patch.object(adapter, "_create_agent", return_value=MagicMock()):
+                accepted = await cli.post("/v1/runs", headers=headers, data=captured_body)
+            assert accepted.status == 202
+            replay = await cli.post("/v1/runs", headers=headers, data=captured_body)
+            assert replay.status == 403
+
+    @pytest.mark.asyncio
+    async def test_anton_origin_enforces_256_kib_raw_delivery_limit(self, adapter, monkeypatch):
+        monkeypatch.setenv("ANTON_CRON_ORIGIN_HMAC_KEY", "anton-test-key")
+        origin = json.dumps({"origin": "anton", "originConversationId": "conversation-1"}, separators=(",", ":"))
+        body = b'{"input":"' + b"x" * (256 * 1024) + b'"}'
+        headers = _anton_origin_headers(origin, datetime.now(timezone.utc).isoformat(), body)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs", headers=headers, data=body)
+        assert response.status == 413
 
 
 # ---------------------------------------------------------------------------

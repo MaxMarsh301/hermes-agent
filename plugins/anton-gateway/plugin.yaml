@@ -1,0 +1,7 @@
+name: anton-gateway
+label: ANTON Gateway
+kind: backend
+version: 1.0.0
+description: Signed ANTON resolver and cron delivery platform.
+provides_tools:
+  - anton_resolve
