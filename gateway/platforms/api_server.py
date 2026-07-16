@@ -32,23 +32,32 @@ Requires:
 """
 
 import asyncio
+import base64
 from collections import OrderedDict
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import io
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+import keyword
 import logging
 import os
 import socket as _socket
 import re
+import secrets
 import sqlite3
+import tempfile
+import threading
 import time
+import unicodedata
 import uuid
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import tokenize
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -71,10 +80,51 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from gateway.platforms.run_files import RunFileError, RunFileStore, owner_digest
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+
+class _RunEventEmitter:
+    """Serialize one run's cross-thread SSE events before they reach its queue."""
+
+    def __init__(self, loop: "asyncio.AbstractEventLoop", queue: "asyncio.Queue[Optional[Dict]]"):
+        self._loop = loop
+        self._queue = queue
+        self._lock = threading.Lock()
+        self._next_seq = 1
+        self._closed = False
+
+    def emit(self, event: Dict[str, Any]) -> bool:
+        """Assign a sequence and enqueue without waiting for the event loop."""
+        with self._lock:
+            if self._closed:
+                return False
+            payload = dict(event)
+            payload["seq"] = self._next_seq
+            self._next_seq += 1
+            try:
+                # Scheduling while locked makes queue order equal seq even when
+                # executor and event-loop threads race each other.
+                self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+            except Exception:
+                return False
+            return True
+
+    def close(self, *, signal: bool = True) -> bool:
+        """Close the emitter and optionally queue the terminal SSE sentinel."""
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+            if signal:
+                try:
+                    self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
+                except Exception:
+                    pass
+            return True
 
 
 def _hermes_version() -> str:
@@ -997,6 +1047,10 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # This key deliberately has no persistence or configuration source: a
+        # Runs agent ID is only meaningful within this server process and must
+        # not be derivable from API credentials or a child/session identifier.
+        self._public_agent_id_key = secrets.token_bytes(32)
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1025,6 +1079,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Retained after stream cleanup so late callbacks cannot reopen a run.
+        self._run_emitters: Dict[str, _RunEventEmitter] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -1040,6 +1096,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Clarification IDs currently owned by each run. Clients can resolve
+        # only an ID emitted by that exact run, even if runs share a session.
+        self._run_clarification_ids: Dict[str, set[str]] = {}
+        # Phase 5: session-owned upload records and per-run output directories.
+        # This is not a general filesystem API: only the file store can resolve
+        # browser-supplied IDs and only a run's own output directory is exposed.
+        hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        self._run_files = RunFileStore(hermes_home / "api_run_files")
+        self._run_file_owners: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -1468,6 +1533,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        interim_assistant_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -1585,6 +1651,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            interim_assistant_callback=interim_assistant_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -1736,8 +1803,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "run_clarification_response": True,
+                "run_file_uploads": True,
+                "run_multimodal_attachments": True,
+                "run_artifacts": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "clarification_events": True,
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
@@ -1762,6 +1834,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_clarification": {"method": "POST", "path": "/v1/runs/{run_id}/clarification"},
+                "uploads": {"method": "POST", "path": "/v1/uploads", "max_bytes": 8388608},
+                "upload": {"method": "DELETE", "path": "/v1/uploads/{file_id}"},
+                "run_artifacts": {"method": "GET", "path": "/v1/runs/{run_id}/artifacts"},
+                "run_artifact_download": {"method": "GET", "path": "/v1/runs/{run_id}/artifacts/{artifact_id}/download"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -4350,6 +4427,133 @@ class APIServerAdapter(BasePlatformAdapter):
             self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------
+    # /v1/uploads and run artifact delivery
+    # ------------------------------------------------------------------
+
+    def _run_file_owner(self, request: "web.Request") -> tuple[Optional[str], Optional["web.Response"]]:
+        session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return None, key_err
+        try:
+            return owner_digest(session_key or ""), None
+        except RunFileError as exc:
+            return None, web.json_response(
+                _openai_error(str(exc), code=exc.code), status=exc.status
+            )
+
+    @staticmethod
+    def _run_file_error(exc: RunFileError) -> "web.Response":
+        return web.json_response(_openai_error(str(exc), code=exc.code), status=exc.status)
+
+    async def _handle_upload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/uploads — accept one bounded text/image input file.
+
+        Uploads are intentionally session-key-owned and opaque.  This route
+        never returns a filesystem path or a browser-accessible upstream URL.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        owner, owner_err = self._run_file_owner(request)
+        if owner_err is not None:
+            return owner_err
+        if not request.content_type.startswith("multipart/"):
+            return web.json_response(
+                _openai_error("Expected multipart/form-data with a 'file' field", code="invalid_upload"),
+                status=400,
+            )
+        temp_path: Optional[Path] = None
+        try:
+            reader = await request.multipart()
+            part = await reader.next()
+            if part is None or part.name != "file" or not part.filename:
+                raise RunFileError("Expected one multipart field named 'file'", "invalid_upload", 400)
+            fd, raw_temp = tempfile.mkstemp(prefix="upload-", dir=str(self._run_files.upload_root))
+            temp_path = Path(raw_temp)
+            size = 0
+            with os.fdopen(fd, "wb") as output:
+                while True:
+                    chunk = await part.read_chunk(size=64 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 8 * 1024 * 1024:
+                        raise RunFileError("Uploaded file exceeds 8 MiB", "file_too_large", 413)
+                    output.write(chunk)
+            # Reject multiple parts rather than quietly accepting metadata that
+            # a caller may think changes policy.
+            if await reader.next() is not None:
+                raise RunFileError("Only one 'file' field is accepted", "invalid_upload", 400)
+            record = self._run_files.create_upload(
+                filename=part.filename, owner=owner or "", temp_path=temp_path, size=size
+            )
+            temp_path = None
+            return web.json_response({"object": "hermes.file", **record.public()}, status=201)
+        except RunFileError as exc:
+            return self._run_file_error(exc)
+        except Exception:
+            logger.exception("[api_server] upload failed")
+            return web.json_response(_openai_error("Upload could not be processed", code="upload_failed"), status=400)
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    async def _handle_delete_upload(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        owner, owner_err = self._run_file_owner(request)
+        if owner_err is not None:
+            return owner_err
+        try:
+            self._run_files.delete_upload(request.match_info["file_id"], owner or "")
+        except RunFileError as exc:
+            return self._run_file_error(exc)
+        return web.Response(status=204)
+
+    async def _handle_run_artifacts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        owner, owner_err = self._run_file_owner(request)
+        if owner_err is not None:
+            return owner_err
+        run_id = request.match_info["run_id"]
+        if self._run_file_owners.get(run_id) != owner:
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
+        try:
+            artifacts = self._run_files.list_artifacts(run_id=run_id, owner=owner or "")
+        except RunFileError as exc:
+            return self._run_file_error(exc)
+        return web.json_response({"object": "list", "data": artifacts})
+
+    async def _handle_download_artifact(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        owner, owner_err = self._run_file_owner(request)
+        if owner_err is not None:
+            return owner_err
+        run_id = request.match_info["run_id"]
+        if self._run_file_owners.get(run_id) != owner:
+            return web.json_response(_openai_error("Artifact not found", code="artifact_not_found"), status=404)
+        try:
+            record = self._run_files.get_artifact(
+                run_id=run_id, artifact_id=request.match_info["artifact_id"], owner=owner or ""
+            )
+        except RunFileError as exc:
+            return self._run_file_error(exc)
+        response = web.FileResponse(record.path, headers={
+            "Content-Type": record.media_type,
+            "Content-Disposition": f'attachment; filename="{record.name}"',
+            "X-Content-Type-Options": "nosniff",
+        })
+        return response
+
+    # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
 
@@ -4371,51 +4575,461 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
-            self._set_run_status(
-                run_id,
-                self._run_statuses.get(run_id, {}).get("status", "running"),
-                last_event=event.get("event"),
-            )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
+    def _run_event_emitter(
+        self, run_id: str, loop: Optional["asyncio.AbstractEventLoop"] = None,
+    ) -> Optional[_RunEventEmitter]:
+        emitter = self._run_emitters.get(run_id)
+        if emitter is not None:
+            return emitter
+        queue = self._run_streams.get(run_id)
+        if queue is None:
+            return None
+        if loop is None:
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return None
+        emitter = _RunEventEmitter(loop, queue)
+        # Live runs initialize this on the loop thread. The fallback supports
+        # callback-focused tests that install a queue directly.
+        return self._run_emitters.setdefault(run_id, emitter)
+
+    def _emit_run_event(
+        self, run_id: str, event: Dict[str, Any], loop: Optional["asyncio.AbstractEventLoop"] = None,
+    ) -> bool:
+        emitter = self._run_event_emitter(run_id, loop)
+        return emitter.emit(event) if emitter is not None else False
+
+    def _close_run_event_emitter(self, run_id: str, *, signal: bool = True) -> None:
+        emitter = self._run_event_emitter(run_id)
+        if emitter is not None:
+            emitter.close(signal=signal)
+
+    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Return the non-lifecycle progress callback for a Runs SSE queue."""
+        last_was_notice = False
+        def _push(event: Dict[str, Any]) -> None:
+            nonlocal last_was_notice
+            if self._emit_run_event(run_id, event, loop):
+                last_was_notice = event.get("event") == "progress.notice"
+                self._set_run_status(
+                    run_id,
+                    self._run_statuses.get(run_id, {}).get("status", "running"),
+                    last_event=event.get("event"),
+                )
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+            nonlocal last_was_notice
             ts = time.time()
-            if event_type == "tool.started":
-                _push({
-                    "event": "tool.started",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "preview": preview,
-                })
-            elif event_type == "tool.completed":
-                _push({
-                    "event": "tool.completed",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
-                })
+            # Tool lifecycle is owned exclusively by the structured callbacks
+            # below: tool_progress_callback has no stable call ID.
+            if event_type.startswith("subagent."):
+                # Delegate progress is not a child transcript.  Only the closed,
+                # per-agent projection below can cross the Runs boundary.
+                event = self._public_background_event(run_id, event_type, kwargs)
+                if event is not None:
+                    _push(event)
             elif event_type == "reasoning.available":
+                # Native reasoning is private.  A bounded, static liveness
+                # notice is enough for Runs clients and cannot contain CoT.
+                if last_was_notice:
+                    return
                 _push({
-                    "event": "reasoning.available",
+                    "event": "progress.notice",
                     "run_id": run_id,
                     "timestamp": ts,
-                    "text": preview or "",
+                    "kind": "thinking",
                 })
-            # _thinking and subagent_progress are intentionally not forwarded
+            # Thinking and native reasoning payloads are intentionally not forwarded.
+            # Subagent lifecycle is forwarded above as a redacted background.updated
+            # event; it deliberately contains no child context or tool details.
 
         return _callback
+
+    _PUBLIC_RUN_TOOL_NAMES = frozenset({
+        "browser_click", "browser_navigate", "browser_snapshot", "browser_type",
+        "delegate_task", "execute_code", "patch", "read_file", "search_files", "skill_view",
+        "terminal", "web_search", "write_file",
+    })
+
+    _PUBLIC_RUN_ACTION_KINDS = {
+        "read_file": "read",
+        "write_file": "write",
+        "patch": "edit",
+        "search_files": "search",
+        "terminal": "execute",
+        "execute_code": "execute",
+        "delegate_task": "delegate",
+        "web_search": "search",
+        "browser_navigate": "navigate",
+        "browser_click": "interact",
+        "browser_type": "interact",
+        "browser_snapshot": "inspect",
+        "skill_view": "read",
+    }
+
+    @classmethod
+    def _public_run_tool_name(cls, tool_name: Any) -> str:
+        """Fail closed rather than reflecting an arbitrary plugin name."""
+        return tool_name if isinstance(tool_name, str) and tool_name in cls._PUBLIC_RUN_TOOL_NAMES else "tool"
+
+    @classmethod
+    def _public_run_action_kind(cls, public_tool_name: str) -> str:
+        """Return one of the browser Runs action-kind enum values."""
+        return cls._PUBLIC_RUN_ACTION_KINDS.get(public_tool_name, "generic")
+
+    @staticmethod
+    def _public_run_tool_target(tool_name: str, args: Any) -> Optional[tuple[str, str]]:
+        """Project a tiny browser-safe target and its ANTON Gateway kind."""
+        if not isinstance(args, dict):
+            return None
+        if tool_name in {"read_file", "write_file", "patch"}:
+            path = args.get("path")
+            if isinstance(path, str):
+                basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                return (basename[:255], "file") if basename else None
+        elif tool_name == "skill_view":
+            name = args.get("name")
+            if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+                return name, "skill"
+        elif tool_name == "browser_navigate":
+            url = args.get("url")
+            if isinstance(url, str):
+                try:
+                    hostname = urlsplit(url).hostname
+                except ValueError:
+                    hostname = None
+                if hostname:
+                    return hostname[:253], "website"
+        elif tool_name == "search_files":
+            path = args.get("path")
+            if isinstance(path, str):
+                basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                return (basename[:255], "file") if basename else None
+        return None
+
+    _PUBLIC_AGENT_MAX_TASK_COUNT = 100
+    _PUBLIC_AGENT_MAX_TOOL_COUNT = 100_000
+    _PUBLIC_AGENT_MAX_DURATION_SECONDS = 86_400.0
+    _PUBLIC_AGENT_GOAL_MAX_LENGTH = 8_000
+    _PUBLIC_AGENT_GOAL_MAX_BYTES = 32 * 1024
+    _PUBLIC_AGENT_GOAL_MAX_LINES = 80
+    _PUBLIC_COMMENTARY_MAX_LENGTH = 1_000
+    _PUBLIC_COMMENTARY_MAX_BYTES = 4_096
+    _PUBLIC_COMMENTARY_MAX_LINES = 8
+    # Schemes are deliberately not allowlisted: commentary must never expose a
+    # navigable URI, including file:, ftp:, websocket, or custom transports.
+    _PUBLIC_COMMENTARY_URI_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s<>()\[\]{}\"']*")
+    # An absolute path is safe to recognize after punctuation (``x=/secret``),
+    # but not after a word character so ordinary prose/code such as ``a/b`` is
+    # not mistaken for a filesystem location. Keep closing punctuation out of
+    # the match so surrounding prose remains readable.
+    _PUBLIC_COMMENTARY_UNIX_PATH_RE = re.compile(r"(?<!\w)/[^\s,;'\"<>()\[\]{}]+")
+    _PUBLIC_COMMENTARY_WINDOWS_PATH_RE = re.compile(
+        r"(?<!\w)(?:[A-Za-z]:[\\/]|\\\\)[^\s,;'\"<>()\[\]{}]+"
+    )
+    _PUBLIC_CODE_PREVIEW_MAX_LINES = 120
+    _PUBLIC_CODE_PREVIEW_MAX_BYTES = 8 * 1024
+    _PUBLIC_CODE_SAFE_NAMES = frozenset({
+        # Python builtins useful for understanding a code outline.
+        "bool", "dict", "enumerate", "float", "int", "isinstance", "len", "list",
+        "max", "min", "print", "range", "set", "sorted", "str", "sum", "tuple", "zip",
+        # Standard-library module names commonly used in standalone snippets.
+        "asyncio", "collections", "datetime", "json", "math", "os", "pathlib", "re", "sys",
+        # Closed Hermes tool vocabulary.
+        "browser_click", "browser_navigate", "browser_snapshot", "browser_type", "delegate_task",
+        "execute_code", "patch", "read_file", "search_files", "skill_view", "terminal",
+        "web_search", "write_file",
+        # Benign operations which make calls and data-flow recognizable.
+        "append", "extend", "get", "items", "join", "keys", "lower", "read_text", "replace",
+        "split", "strip", "upper", "values", "write_text",
+    })
+
+    @staticmethod
+    def _bounded_public_int(value: Any, *, minimum: int, maximum: int) -> Optional[int]:
+        """Return a strict, bounded integer without accepting bools or floats."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and minimum <= value <= maximum:
+            return value
+        return None
+
+    def _public_agent_id(self, run_id: Any, subagent_id: Any) -> Optional[str]:
+        """Return a process-local, run-scoped opaque child identifier."""
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or "\x00" in run_id
+            or not isinstance(subagent_id, str)
+            or not subagent_id
+            or "\x00" in subagent_id
+        ):
+            return None
+        try:
+            message = b"work-trace:v2\0" + run_id.encode("utf-8") + b"\0" + subagent_id.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        digest = hmac.digest(self._public_agent_id_key, message, "sha256")[:18]
+        return "agent_" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    @classmethod
+    def _public_agent_goal(cls, goal: Any) -> Optional[tuple[str, bool]]:
+        """Return a safe multiline goal and a deterministic truncation flag."""
+        if not isinstance(goal, str) or "\x00" in goal:
+            return None
+        try:
+            safe = unicodedata.normalize("NFKC", goal)
+        except (TypeError, ValueError):
+            return None
+        private_tag = r"(?:think|thinking|reasoning|scratchpad|memory(?:[-_ ]context)?)"
+        # A private tag makes the provenance ambiguous; reject rather than
+        # attempting to strip a potentially malformed reasoning span.
+        if re.search(
+            rf"(?is)(?:<\s*/?\s*{private_tag}\b[^>]*>|\[\s*/?\s*{private_tag}\b[^\]]*\])",
+            safe,
+        ):
+            return None
+        safe = safe.replace("\r\n", "\n").replace("\r", "\n")
+        safe = "".join(
+            " " if unicodedata.category(char).startswith("C") and char != "\n" else char
+            for char in safe
+        )
+        safe = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in safe.split("\n") if line.strip())
+        if not safe:
+            return None
+        safe = cls._PUBLIC_COMMENTARY_URI_RE.sub("[redacted-url]", safe)
+        safe = cls._PUBLIC_COMMENTARY_UNIX_PATH_RE.sub("[redacted-path]", safe)
+        safe = cls._PUBLIC_COMMENTARY_WINDOWS_PATH_RE.sub("[redacted-path]", safe)
+        safe = re.sub(
+            r"\b(?:authorization|api[_-]?key|access[_-]?token|auth[_-]?token|cookie|set-cookie|password|secret|token)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+            "[redacted-secret]", safe, flags=re.IGNORECASE,
+        )
+        try:
+            # Browser-bound delegated goals must not inherit a logging-redaction opt-out.
+            safe = redact_sensitive_text(safe, force=True)
+        except Exception:
+            return None
+        safe = cls._PUBLIC_COMMENTARY_URI_RE.sub("[redacted-url]", safe)
+        safe = cls._PUBLIC_COMMENTARY_UNIX_PATH_RE.sub("[redacted-path]", safe)
+        safe = cls._PUBLIC_COMMENTARY_WINDOWS_PATH_RE.sub("[redacted-path]", safe)
+        safe = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in safe.splitlines() if line.strip())
+        if not safe:
+            return None
+        truncated = False
+        lines = safe.splitlines()
+        if len(lines) > cls._PUBLIC_AGENT_GOAL_MAX_LINES:
+            lines = lines[:cls._PUBLIC_AGENT_GOAL_MAX_LINES]
+            truncated = True
+        safe = "\n".join(lines)
+        if len(safe) > cls._PUBLIC_AGENT_GOAL_MAX_LENGTH:
+            safe = safe[:cls._PUBLIC_AGENT_GOAL_MAX_LENGTH]
+            truncated = True
+        bounded: list[str] = []
+        used = 0
+        try:
+            for char in safe:
+                size = len(char.encode("utf-8"))
+                if used + size > cls._PUBLIC_AGENT_GOAL_MAX_BYTES:
+                    truncated = True
+                    break
+                bounded.append(char)
+                used += size
+        except UnicodeEncodeError:
+            return None
+        safe = "".join(bounded).rstrip()
+        return (safe, truncated) if safe else None
+
+    @classmethod
+    def _public_assistant_commentary(cls, text: Any) -> Optional[str]:
+        """Return a bounded public interim message, or reject it fail-closed.
+
+        This callback is the only allowed source of Runs commentary. The agent
+        normally removes complete think blocks first, but that is not trusted as
+        a browser-security boundary.
+        """
+        if not isinstance(text, str) or "\x00" in text:
+            return None
+        try:
+            safe = unicodedata.normalize("NFKC", text)
+        except (TypeError, ValueError):
+            return None
+        private_tag = r"(?:think|thinking|reasoning|scratchpad|memory(?:[-_ ]context)?)"
+        # Strip complete private spans, but reject an unmatched/residual tag:
+        # guessing whether its following text is reasoning would fail open.
+        safe = re.sub(
+            rf"(?is)<\s*{private_tag}\b[^>]*>.*?<\s*/\s*{private_tag}\s*>",
+            "",
+            safe,
+        )
+        if re.search(rf"(?is)<\s*/?\s*{private_tag}\b[^>]*>", safe):
+            return None
+        safe = safe.replace("\r\n", "\n").replace("\r", "\n")
+        safe = re.sub(r"[\x00-\x09\x0b-\x1f\x7f]+", " ", safe)
+        safe = "\n".join(
+            re.sub(r"[ \t]+", " ", line).strip()
+            for line in safe.split("\n")
+            if line.strip()
+        )
+        if not safe:
+            return None
+        # Reduce locations before and after shared redaction. The latter check
+        # guards future changes to the shared redactor's URL/path policy.
+        safe = cls._PUBLIC_COMMENTARY_URI_RE.sub("[redacted-url]", safe)
+        safe = cls._PUBLIC_COMMENTARY_UNIX_PATH_RE.sub("[redacted-path]", safe)
+        safe = cls._PUBLIC_COMMENTARY_WINDOWS_PATH_RE.sub("[redacted-path]", safe)
+        try:
+            safe = redact_sensitive_text(safe, force=True)
+        except Exception:
+            return None
+        safe = cls._PUBLIC_COMMENTARY_URI_RE.sub("[redacted-url]", safe)
+        safe = cls._PUBLIC_COMMENTARY_UNIX_PATH_RE.sub("[redacted-path]", safe)
+        safe = cls._PUBLIC_COMMENTARY_WINDOWS_PATH_RE.sub("[redacted-path]", safe)
+        safe = "\n".join(line.strip() for line in safe.splitlines() if line.strip())
+        safe = "\n".join(safe.splitlines()[:cls._PUBLIC_COMMENTARY_MAX_LINES])
+        safe = safe[:cls._PUBLIC_COMMENTARY_MAX_LENGTH]
+        bounded: list[str] = []
+        used = 0
+        try:
+            for char in safe:
+                width = len(char.encode("utf-8"))
+                if used + width > cls._PUBLIC_COMMENTARY_MAX_BYTES:
+                    break
+                bounded.append(char)
+                used += width
+        except UnicodeEncodeError:
+            return None
+        return "".join(bounded).strip() or None
+
+    @classmethod
+    def _public_execute_code_preview(cls, code: Any) -> Optional[tuple[str, bool]]:
+        """Return a literal-free Python skeleton, or nothing on tokenization failure."""
+        if not isinstance(code, str) or "\x00" in code:
+            return None
+        try:
+            code.encode("utf-8")
+            tokens = []
+            for token_info in tokenize.generate_tokens(io.StringIO(code).readline):
+                if token_info.type == tokenize.COMMENT:
+                    continue
+                if token_info.type == tokenize.STRING:
+                    tokens.append((token_info.type, "'…'"))
+                elif token_info.type == tokenize.NUMBER:
+                    tokens.append((token_info.type, "0"))
+                elif token_info.type == tokenize.NAME:
+                    name = token_info.string
+                    tokens.append((
+                        token_info.type,
+                        name if (keyword.iskeyword(name) or keyword.issoftkeyword(name) or name in cls._PUBLIC_CODE_SAFE_NAMES) else "value",
+                    ))
+                elif token_info.type == tokenize.ERRORTOKEN:
+                    return None
+                else:
+                    tokens.append((token_info.type, token_info.string))
+            preview = tokenize.untokenize(tokens)
+            preview.encode("utf-8")
+        except (IndentationError, SyntaxError, tokenize.TokenError, UnicodeError, ValueError):
+            return None
+        except Exception:
+            return None
+        lines = preview.splitlines(keepends=True)
+        truncated = len(lines) > cls._PUBLIC_CODE_PREVIEW_MAX_LINES
+        preview = "".join(lines[:cls._PUBLIC_CODE_PREVIEW_MAX_LINES])
+        encoded = preview.encode("utf-8")
+        if len(encoded) > cls._PUBLIC_CODE_PREVIEW_MAX_BYTES:
+            preview = encoded[:cls._PUBLIC_CODE_PREVIEW_MAX_BYTES].decode("utf-8", errors="ignore")
+            truncated = True
+        return preview, truncated
+
+    def _public_background_event(
+        self, run_id: str, event_type: str, kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create the closed, per-child public background lifecycle projection."""
+        agent_id = self._public_agent_id(run_id, kwargs.get("subagent_id"))
+        if agent_id is None:
+            return None
+        task_count = self._bounded_public_int(
+            kwargs.get("task_count"), minimum=1, maximum=self._PUBLIC_AGENT_MAX_TASK_COUNT,
+        )
+        task_index = self._bounded_public_int(
+            kwargs.get("task_index"), minimum=0, maximum=self._PUBLIC_AGENT_MAX_TASK_COUNT - 1,
+        )
+        if task_count is None or task_index is None or task_index >= task_count:
+            return None
+        raw_status = str(kwargs.get("status") or "").lower()
+        status = "failed" if event_type == "subagent.complete" and raw_status in {
+            "failed", "error", "timeout", "interrupted", "cancelled", "canceled",
+        } else (
+            "completed" if event_type == "subagent.complete" else "running"
+        )
+        event: Dict[str, Any] = {
+            "event": "background.updated", "run_id": run_id, "timestamp": time.time(),
+            "agent_id": agent_id, "status": status,
+            "task_index": task_index, "task_count": task_count,
+        }
+        public_goal = self._public_agent_goal(kwargs.get("goal"))
+        if public_goal is not None:
+            event["goal"], event["goal_truncated"] = public_goal
+        tool_count = self._bounded_public_int(
+            kwargs.get("tool_count"), minimum=0, maximum=self._PUBLIC_AGENT_MAX_TOOL_COUNT,
+        )
+        if tool_count is not None:
+            event["tool_count"] = tool_count
+        duration = kwargs.get("duration_seconds")
+        if event_type == "subagent.complete" and isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            duration = float(duration)
+            if 0 <= duration <= self._PUBLIC_AGENT_MAX_DURATION_SECONDS:
+                event["duration"] = duration
+        return event
+
+    def _make_run_tool_callbacks(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Return correlated lifecycle callbacks for the Runs SSE transport."""
+        started_at: Dict[str, float] = {}
+
+        def _push(event: Dict[str, Any]) -> None:
+            if self._emit_run_event(run_id, event, loop):
+                self._set_run_status(
+                    run_id, self._run_statuses.get(run_id, {}).get("status", "running"),
+                    last_event=event["event"],
+                )
+
+        def _start(tool_call_id: Any, tool_name: Any, tool_args: Any) -> None:
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                return
+            public_name = self._public_run_tool_name(tool_name)
+            event = {
+                "event": "tool.started", "run_id": run_id, "timestamp": time.time(),
+                "tool_call_id": tool_call_id, "tool": public_name,
+                "action_kind": self._public_run_action_kind(public_name),
+            }
+            target = self._public_run_tool_target(public_name, tool_args)
+            if target is not None:
+                event["target"], event["target_kind"] = target
+            if public_name == "delegate_task" and isinstance(tool_args, dict):
+                tasks = tool_args.get("tasks")
+                goal = tool_args.get("goal")
+                count = len(tasks) if isinstance(tasks, list) else (1 if isinstance(goal, str) and goal.strip() else 0)
+                if 1 <= count <= self._PUBLIC_AGENT_MAX_TASK_COUNT:
+                    event["agent_count"] = count
+            if public_name == "execute_code" and isinstance(tool_args, dict):
+                preview = self._public_execute_code_preview(tool_args.get("code"))
+                if preview is not None:
+                    event["code_preview"], event["code_truncated"] = preview
+            started_at[tool_call_id] = time.monotonic()
+            _push(event)
+
+        def _complete(tool_call_id: Any, tool_name: Any, _tool_args: Any, _result: Any) -> None:
+            if not isinstance(tool_call_id, str) or tool_call_id not in started_at:
+                return
+            started = started_at.pop(tool_call_id)
+            public_name = self._public_run_tool_name(tool_name)
+            _push({
+                "event": "tool.completed", "run_id": run_id, "timestamp": time.time(),
+                "tool_call_id": tool_call_id, "tool": public_name,
+                "action_kind": self._public_run_action_kind(public_name),
+                "duration": round(time.monotonic() - started, 3),
+            })
+
+        return _start, _complete
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -4454,12 +5068,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
 
         raw_input = body.get("input")
-        if not raw_input:
+        if raw_input is None:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
+        # A run accepts native text/image content plus opaque IDs previously
+        # minted by POST /v1/uploads. Browser clients never pass local paths or
+        # upstream URLs. File IDs are session-owned and resolved before agent
+        # execution; unknown, expired or cross-session IDs look like 404.
+        raw_content: Any
+        if isinstance(raw_input, list) and raw_input and isinstance(raw_input[-1], dict) and "content" in raw_input[-1]:
+            raw_content = raw_input[-1].get("content")
+        else:
+            raw_content = raw_input
+        attachment_ids = body.get("attachments")
+        records = []
+        file_owner = owner_digest(gateway_session_key) if gateway_session_key else ""
+        if attachment_ids is not None:
+            try:
+                if not file_owner:
+                    raise RunFileError("X-Hermes-Session-Key is required for attachments", "missing_session_key", 400)
+                records = self._run_files.resolve_uploads(attachment_ids, file_owner)
+                raw_content = self._run_files.multimodal_parts(raw_content, records)
+            except RunFileError as exc:
+                return self._run_file_error(exc)
+        if not _content_has_visible_payload(raw_content):
+            return web.json_response(_openai_error("No user message or attachment found in input"), status=400)
+        try:
+            user_message = _normalize_multimodal_content(raw_content)
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="input")
+        if not _content_has_visible_payload(user_message):
+            return web.json_response(_openai_error("No user message or attachment found in input"), status=400)
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -4511,20 +5150,33 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
+        # per API run. Client-provided session IDs are conversation scopes, not
+        # authorization namespaces.
         approval_session_key = run_id
+        artifact_dir: Optional[Path] = None
+        if file_owner:
+            artifact_dir = self._run_files.artifact_dir(run_id)
+            self._run_file_owners[run_id] = file_owner
+            artifact_instruction = (
+                "If this turn creates a downloadable deliverable, write it only under "
+                f"{artifact_dir}. Do not read, copy, or expose unrelated local files. "
+                "Keep the final response concise; downloadable outputs will be listed separately."
+            )
+            instructions = f"{str(instructions or '').strip()}\n\n{artifact_instruction}".strip()
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
         self._run_streams[run_id] = q
+        self._run_emitters[run_id] = _RunEventEmitter(loop, q)
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        self._run_clarification_ids[run_id] = set()
 
+        # Legacy progress remains only for non-lifecycle liveness updates;
+        # correlated tool callbacks are the sole lifecycle transport.
         event_cb = self._make_run_event_callback(run_id, loop)
+        tool_start_cb, tool_complete_cb = self._make_run_tool_callbacks(run_id, loop)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
@@ -4535,17 +5187,27 @@ class APIServerAdapter(BasePlatformAdapter):
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
-            if run_id not in self._run_streams:
+            self._emit_run_event(run_id, {
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "delta": delta,
+            }, loop)
+
+        def _interim_assistant_cb(text: Any, *, already_streamed: bool = False) -> None:
+            # Deltas remain private to the BFF history path. Therefore Runs
+            # deliberately ignores the platform-rendering dedupe flag and emits
+            # only explicitly public interim prose as a separate trace event.
+            del already_streamed
+            commentary = self._public_assistant_commentary(text)
+            if commentary is None:
                 return
-            try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
+            self._emit_run_event(run_id, {
+                "event": "assistant.commentary",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "text": commentary,
+            }, loop)
 
         self._set_run_status(
             run_id,
@@ -4577,40 +5239,77 @@ class APIServerAdapter(BasePlatformAdapter):
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
+                    interim_assistant_callback=_interim_assistant_cb,
                     tool_progress_callback=event_cb,
+                    tool_start_callback=tool_start_cb,
+                    tool_complete_callback=tool_complete_cb,
                     gateway_session_key=gateway_session_key,
                     route=route,
                 )
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
+                    # The Runs API is a browser/control-plane contract, not a
+                    # privileged terminal transcript. Never emit a command,
+                    # pattern key, or tool arguments here: a client needs the
+                    # risk explanation and a bounded scope, not raw execution
+                    # details it could replay or leak.
+                    event = {
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
+                        "action": "terminal.command",
+                        "description": _redact_api_error_text(
+                            (approval_data or {}).get("description") or "Potentially dangerous command"
+                        )[:500],
                         "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
+                            smart_denied=bool((approval_data or {}).get("smart_denied")),
+                            allow_permanent=(approval_data or {}).get("allow_permanent") is not False,
                         ),
-                    })
+                    }
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
                     )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
+                    self._emit_run_event(run_id, event, loop)
+
+                def _clarify_callback(question: str, choices: Optional[list]) -> str:
+                    """Bridge synchronous ``clarify`` calls to this run's SSE stream."""
+                    from tools import clarify_gateway
+
+                    clarify_id = uuid.uuid4().hex[:16]
+                    entry = clarify_gateway.register(
+                        clarify_id=clarify_id,
+                        session_key=approval_session_key,
+                        question=str(question or "").strip(),
+                        choices=list(choices) if choices else None,
+                    )
+                    self._run_clarification_ids.setdefault(run_id, set()).add(clarify_id)
+                    event = {
+                        "event": "clarification.request",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "clarification_id": clarify_id,
+                        "question": entry.question,
+                        "choices": entry.choices,
+                    }
+                    if not self._emit_run_event(run_id, event, loop):
+                        clarify_gateway.resolve_gateway_clarify(clarify_id, "")
+                        return "[clarify prompt could not be delivered]"
+                    self._set_run_status(
+                        run_id,
+                        "waiting_for_clarification",
+                        last_event="clarification.request",
+                    )
+
+                    response = clarify_gateway.wait_for_response(
+                        clarify_id, timeout=float(clarify_gateway.get_clarify_timeout())
+                    )
+                    self._run_clarification_ids.get(run_id, set()).discard(clarify_id)
+                    if not response:
+                        return "[user did not respond to clarification request]"
+                    return response
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
@@ -4637,6 +5336,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             session_key=approval_session_key,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
+                        agent.clarify_callback = _clarify_callback
                         r = agent.run_conversation(
                             user_message=user_message,
                             conversation_history=conversation_history,
@@ -4686,7 +5386,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                    _put_event_if_active({
+                    self._emit_run_event(run_id, {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -4700,18 +5400,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    _put_event_if_active({
+                    artifacts: list[dict[str, Any]] = []
+                    if artifact_dir is not None and file_owner:
+                        artifacts = self._run_files.collect_artifacts(run_id=run_id, owner=file_owner)
+                        for artifact in artifacts:
+                            self._emit_run_event(run_id, {
+                                "event": "artifact.created",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "artifact_id": artifact["id"],
+                                "name": artifact["filename"],
+                                "mime_type": artifact["mime_type"],
+                                "bytes": artifact["bytes"],
+                            })
+                        # The agent has the real directory only to write its own
+                        # deliverables. Do not reflect that host path to API users.
+                        final_response = str(final_response).replace(str(artifact_dir), "<artifact>")
+                    self._emit_run_event(run_id, {
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
+                        "artifacts": artifacts,
                     })
                     self._set_run_status(
                         run_id,
                         "completed",
                         output=final_response,
                         usage=usage,
+                        artifacts=artifacts,
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
@@ -4720,14 +5438,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "cancelled",
                     last_event="run.cancelled",
                 )
-                try:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
+                self._emit_run_event(run_id, {
+                    "event": "run.cancelled",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                })
                 raise
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
@@ -4737,15 +5452,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
                 )
-                try:
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
-                    })
-                except Exception:
-                    pass
+                self._emit_run_event(run_id, {
+                    "event": "run.failed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "error": _redact_api_error_text(exc),
+                })
             finally:
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
@@ -4758,15 +5470,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
-                # Sentinel: signal SSE stream to close
-                try:
-                    _put_event_if_active(None)
-                except Exception:
-                    pass
+                # Sentinel is scheduled through the same lock as events, so it
+                # follows the terminal event and closes the emitter permanently.
+                self._close_run_event_emitter(run_id)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                for clarification_id in self._run_clarification_ids.pop(run_id, set()):
+                    try:
+                        from tools.clarify_gateway import resolve_gateway_clarify
+
+                        resolve_gateway_clarify(clarification_id, "")
+                    except Exception:
+                        pass
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -4922,24 +5639,76 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
+        self._emit_run_event(run_id, {
+            "event": "approval.responded",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "choice": choice,
+            "resolved": resolved,
+        })
 
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+        })
+
+    async def _handle_run_clarification(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/clarification — resolve a request emitted by that run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        if run_id not in self._run_statuses:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        clarification_id = str(body.get("clarification_id") or "").strip()
+        response = body.get("response")
+        if not clarification_id or clarification_id not in self._run_clarification_ids.get(run_id, set()):
+            return web.json_response(
+                _openai_error("Run has no matching pending clarification", code="clarification_not_pending"),
+                status=409,
+            )
+        if not isinstance(response, str) or not response.strip() or len(response) > 12_000:
+            return web.json_response(
+                _openai_error("response must be a non-empty string of at most 12000 characters"),
+                status=400,
+            )
+
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            resolved = resolve_gateway_clarify(clarification_id, response.strip())
+        except Exception as exc:
+            logger.exception("[api_server] clarification resolution failed for run %s", run_id)
+            return web.json_response(_openai_error(str(exc)), status=500)
+        if not resolved:
+            return web.json_response(
+                _openai_error("Clarification is no longer pending", code="clarification_not_pending"),
+                status=409,
+            )
+
+        self._run_clarification_ids.get(run_id, set()).discard(clarification_id)
+        self._set_run_status(run_id, "running", last_event="clarification.responded")
+        self._emit_run_event(run_id, {
+            "event": "clarification.responded",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "clarification_id": clarification_id,
+        })
+        return web.json_response({
+            "object": "hermes.run.clarification_response",
+            "run_id": run_id,
+            "clarification_id": clarification_id,
+            "resolved": True,
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
@@ -4997,6 +5766,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             # The transport TTL always bounds buffering. Live control state is
             # independent and survives until the executor-backed task returns.
+            self._close_run_event_emitter(run_id, signal=False)
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
             if task_done:
@@ -5004,6 +5774,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                clarification_ids = self._run_clarification_ids.pop(run_id, set())
+                if clarification_ids:
+                    try:
+                        from tools.clarify_gateway import resolve_gateway_clarify
+
+                        for clarification_id in clarification_ids:
+                            resolve_gateway_clarify(clarification_id, "")
+                    except Exception:
+                        pass
 
         stale_statuses = [
             run_id
@@ -5013,6 +5792,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_emitters.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -5111,11 +5891,16 @@ class APIServerAdapter(BasePlatformAdapter):
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
             if _CRON_AVAILABLE:
                 self._app.router.add_post("/api/cron/fire", self._handle_cron_fire)
-            # Structured event streaming
+            # Structured event streaming and bounded run-file control plane.
+            self._app.router.add_post("/v1/uploads", self._handle_upload)
+            self._app.router.add_delete("/v1/uploads/{file_id}", self._handle_delete_upload)
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_get("/v1/runs/{run_id}/artifacts", self._handle_run_artifacts)
+            self._app.router.add_get("/v1/runs/{run_id}/artifacts/{artifact_id}/download", self._handle_download_artifact)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
+            self._app.router.add_post("/v1/runs/{run_id}/clarification", self._handle_run_clarification)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering

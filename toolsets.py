@@ -395,7 +395,7 @@ TOOLSETS = {
     },
 
     "hermes-api-server": {
-        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
+        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP; clarify is delivered through the structured runs event contract",
         "tools": [
             # Web
             "web_search", "web_extract",
@@ -412,8 +412,8 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            # Planning & memory
-            "todo", "memory",
+            # Planning, memory, and structured clarification
+            "todo", "memory", "clarify",
             # Session history search
             "session_search",
             # Code execution + delegation

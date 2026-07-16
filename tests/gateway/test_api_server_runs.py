@@ -9,12 +9,15 @@ Covers:
 """
 
 import asyncio
+import hashlib
+import re
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
@@ -65,10 +68,15 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
+    app.router.add_post("/v1/uploads", adapter._handle_upload)
+    app.router.add_delete("/v1/uploads/{file_id}", adapter._handle_delete_upload)
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_get("/v1/runs/{run_id}/artifacts", adapter._handle_run_artifacts)
+    app.router.add_get("/v1/runs/{run_id}/artifacts/{artifact_id}/download", adapter._handle_download_artifact)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/clarification", adapter._handle_run_clarification)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -212,8 +220,107 @@ class TestStartRun:
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/runs/{run_id} — poll run status
+# Phase 5 — bounded upload, multimodal run input, and artifacts
 # ---------------------------------------------------------------------------
+
+
+class TestRunFiles:
+    @pytest.mark.asyncio
+    async def test_text_upload_is_session_owned_and_becomes_run_input(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        headers = {"Authorization": "Bearer sk-secret", "X-Hermes-Session-Key": "anton-chat:conversation-a"}
+        async with TestClient(TestServer(app)) as cli:
+            form = FormData()
+            form.add_field("file", b"alpha,beta\n1,2\n", filename="notes.csv", content_type="text/csv")
+            uploaded = await cli.post("/v1/uploads", data=form, headers=headers)
+            assert uploaded.status == 201
+            file_data = await uploaded.json()
+            assert file_data["id"].startswith("file_")
+            assert file_data["kind"] == "text"
+
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+                mock_create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs", json={"input": "Summarize the attachment", "attachments": [file_data["id"]]}, headers=headers
+                )
+                assert started.status == 202
+                run_id = (await started.json())["run_id"]
+                for _ in range(30):
+                    status = await (await cli.get(f"/v1/runs/{run_id}", headers=headers)).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+                assert status["status"] == "completed"
+                user_message = mock_create.return_value.run_conversation.call_args.kwargs["user_message"]
+                assert "Uploaded file: notes.csv" in user_message
+                assert "alpha,beta" in user_message
+
+            denied = await cli.post(
+                "/v1/runs",
+                json={"input": "steal", "attachments": [file_data["id"]]},
+                headers={"Authorization": "Bearer sk-secret", "X-Hermes-Session-Key": "anton-chat:conversation-b"},
+            )
+            assert denied.status == 404
+
+    @pytest.mark.asyncio
+    async def test_image_upload_becomes_multimodal_part_and_artifact_download_is_owned(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        headers = {"Authorization": "Bearer sk-secret", "X-Hermes-Session-Key": "anton-chat:conversation-a"}
+        async with TestClient(TestServer(app)) as cli:
+            form = FormData()
+            form.add_field("file", b"\x89PNG\r\n\x1a\nimage", filename="photo.png", content_type="image/png")
+            uploaded = await cli.post("/v1/uploads", data=form, headers=headers)
+            file_id = (await uploaded.json())["id"]
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+                def write_artifact(**kwargs):
+                    prompt = mock_create.call_args.kwargs["ephemeral_system_prompt"]
+                    artifact_dir = prompt.split("write it only under ", 1)[1].split(". Do not", 1)[0]
+                    output = Path(artifact_dir) / "report.txt"
+                    output.write_text("artifact contents", encoding="utf-8")
+                    return {"final_response": f"Saved {output}"}
+
+                agent.run_conversation.side_effect = write_artifact
+                mock_create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs", json={"input": "Describe and export", "attachments": [file_id]}, headers=headers
+                )
+                run_id = (await started.json())["run_id"]
+                for _ in range(30):
+                    status = await (await cli.get(f"/v1/runs/{run_id}", headers=headers)).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+                assert status["status"] == "completed"
+                assert "<artifact>" in status["output"]
+                assert len(status["artifacts"]) == 1
+                parts = agent.run_conversation.call_args.kwargs["user_message"]
+                assert isinstance(parts, list)
+                assert parts[-1]["type"] == "image_url"
+
+                listed = await cli.get(f"/v1/runs/{run_id}/artifacts", headers=headers)
+                assert listed.status == 200
+                artifact = (await listed.json())["data"][0]
+                download = await cli.get(
+                    f"/v1/runs/{run_id}/artifacts/{artifact['id']}/download", headers=headers
+                )
+                assert download.status == 200
+                assert await download.text() == "artifact contents"
+                foreign = await cli.get(
+                    f"/v1/runs/{run_id}/artifacts/{artifact['id']}/download",
+                    headers={"Authorization": "Bearer sk-secret", "X-Hermes-Session-Key": "anton-chat:conversation-b"},
+                )
+                assert foreign.status == 404
+
 
 
 class TestRunStatus:
@@ -460,6 +567,475 @@ class TestRunEvents:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/runs/run_any/events")
         assert resp.status == 401
+
+
+class TestRunPublicToolLifecycle:
+    @pytest.mark.asyncio
+    async def test_lifecycle_is_correlated_and_legacy_progress_cannot_duplicate(self, adapter):
+        run_id = "run-tool-correlation"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        loop = asyncio.get_running_loop()
+        progress = adapter._make_run_event_callback(run_id, loop)
+        started, completed = adapter._make_run_tool_callbacks(run_id, loop)
+
+        # This is still fired by the executor, but has no stable ID and must
+        # never reach Runs as a second lifecycle event.
+        progress("tool.started", "read_file", "private preview", {"path": "/secret/a.txt"})
+        started("call_123", "read_file", {"path": "/secret/a.txt", "token": "do-not-leak"})
+        progress("tool.completed", "read_file", None, None, result="do-not-leak")
+        completed("call_123", "read_file", {"path": "/secret/a.txt"}, "do-not-leak")
+        await asyncio.sleep(0)
+
+        events = [adapter._run_streams[run_id].get_nowait() for _ in range(2)]
+        assert [event["event"] for event in events] == ["tool.started", "tool.completed"]
+        assert {event["tool_call_id"] for event in events} == {"call_123"}
+        assert [event["action_kind"] for event in events] == ["read", "read"]
+        assert events[0]["target"] == "a.txt"
+        assert events[0]["target_kind"] == "file"
+        assert "preview" not in events[0]
+        assert "result" not in events[1]
+        assert "token" not in repr(events)
+        assert "/secret/" not in repr(events)
+
+    @pytest.mark.asyncio
+    async def test_public_targets_are_basename_skill_or_hostname_only(self, adapter):
+        run_id = "run-tool-targets"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        started, _ = adapter._make_run_tool_callbacks(run_id, asyncio.get_running_loop())
+
+        started("file", "write_file", {"path": r"C:\\private\\report.txt", "content": "SECRET"})
+        started("patch", "patch", {"path": "/private/settings.toml", "patch": "SECRET"})
+        started("skill", "skill_view", {"name": "hermes-agent", "other": "SECRET"})
+        started("web", "browser_navigate", {"url": "https://user:SECRET@example.test/x?q=SECRET"})
+        await asyncio.sleep(0)
+        events = [adapter._run_streams[run_id].get_nowait() for _ in range(4)]
+
+        assert [event["target"] for event in events] == ["report.txt", "settings.toml", "hermes-agent", "example.test"]
+        assert [event["target_kind"] for event in events] == ["file", "file", "skill", "website"]
+        assert "SECRET" not in repr(events)
+        assert "https://" not in repr(events)
+        assert "private" not in repr(events)
+
+    @pytest.mark.asyncio
+    async def test_action_kind_mapping_and_browser_actions_are_allowlisted(self, adapter):
+        run_id = "run-tool-kinds"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        started, completed = adapter._make_run_tool_callbacks(run_id, asyncio.get_running_loop())
+        expected = {
+            "read_file": "read", "write_file": "write", "patch": "edit",
+            "search_files": "search", "terminal": "execute", "execute_code": "execute",
+            "web_search": "search", "browser_navigate": "navigate",
+            "browser_click": "interact", "browser_type": "interact",
+            "browser_snapshot": "inspect", "skill_view": "read",
+        }
+        for index, tool_name in enumerate(expected):
+            call_id = f"call-{index}"
+            started(call_id, tool_name, {"selector": "SECRET", "text": "SECRET", "code": "SECRET"})
+            completed(call_id, tool_name, {"code": "SECRET"}, "SECRET")
+        await asyncio.sleep(0)
+
+        events = [adapter._run_streams[run_id].get_nowait() for _ in range(2 * len(expected))]
+        assert [event["tool"] for event in events[::2]] == list(expected)
+        assert [event["action_kind"] for event in events[::2]] == list(expected.values())
+        assert [event["action_kind"] for event in events[1::2]] == list(expected.values())
+        for event in events:
+            assert "target" not in event
+            assert "target_kind" not in event
+            assert "SECRET" not in repr(event)
+
+    @pytest.mark.asyncio
+    async def test_delegate_count_and_execute_code_preview_are_safe(self, adapter):
+        run_id = "run-delegate-preview"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        started, completed = adapter._make_run_tool_callbacks(run_id, asyncio.get_running_loop())
+        code = "# SECRET comment\npassword = 'SECRET'\namount = 123.45\nmessage = f'token={SECRET}'\n"
+
+        started("delegate", "delegate_task", {"tasks": [{"goal": "SECRET"}, {"goal": "SECRET"}]})
+        completed("delegate", "delegate_task", {}, "SECRET")
+        started("code", "execute_code", {"code": code, "context": "SECRET", "session_id": "raw-session"})
+        started("bad-code", "execute_code", {"code": 123})
+        started("long-code", "execute_code", {"code": "x = 1\n" * 121})
+        started("unknown", "plugin__leak", {"code": code, "tasks": [{"goal": "SECRET"}]})
+        await asyncio.sleep(0)
+        events = [adapter._run_streams[run_id].get_nowait() for _ in range(6)]
+
+        assert events[0]["tool"] == "delegate_task"
+        assert events[0]["action_kind"] == events[1]["action_kind"] == "delegate"
+        assert events[0]["agent_count"] == 2
+        assert "agent_count" not in events[1]
+        preview = events[2]["code_preview"]
+        assert events[2]["code_truncated"] is False
+        compact_preview = preview.replace(" ", "")
+        assert "value='…'" in compact_preview and "value=0" in compact_preview
+        assert "SECRET" not in preview and "comment" not in preview and "123.45" not in preview
+        assert "code_preview" not in events[3] and "code_truncated" not in events[3]
+        assert events[4]["code_truncated"] is True
+        assert len(events[4]["code_preview"].splitlines()) <= 120
+        assert events[5]["tool"] == "tool" and events[5]["action_kind"] == "generic"
+        public = repr(events)
+        for forbidden in ("SECRET", "raw-session", "context", "session_id", "plugin__leak"):
+            assert forbidden not in public
+
+    @pytest.mark.asyncio
+    async def test_search_scope_is_basename_only_and_unknown_tools_fail_closed(self, adapter):
+        run_id = "run-tool-search-private"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        started, completed = adapter._make_run_tool_callbacks(run_id, asyncio.get_running_loop())
+
+        started("search", "search_files", {"path": "/private/project/src", "pattern": "SECRET"})
+        started("plugin", "plugin__leak", {"path": "/private/SECRET", "password": "SECRET"})
+        completed("plugin", "plugin__leak", {"command": "SECRET"}, "SECRET")
+        await asyncio.sleep(0)
+        events = [adapter._run_streams[run_id].get_nowait() for _ in range(3)]
+
+        assert events[0]["tool"] == "search_files"
+        assert events[0]["action_kind"] == "search"
+        assert events[0]["target"] == "src"
+        assert events[0]["target_kind"] == "file"
+        assert events[1]["tool"] == events[2]["tool"] == "tool"
+        assert events[1]["action_kind"] == events[2]["action_kind"] == "generic"
+        public = repr(events)
+        for forbidden in ("SECRET", "plugin__leak", "/private/", "pattern", "password", "command", "result"):
+            assert forbidden not in public
+
+    @pytest.mark.asyncio
+    async def test_reasoning_becomes_one_static_notice_without_native_text(self, adapter):
+        run_id = "run-reasoning-private"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+
+        callback("reasoning.available", "_thinking", "SECRET chain of thought", {"command": "SECRET"})
+        callback("reasoning.available", "_thinking", "SECOND SECRET", None)
+        await asyncio.sleep(0)
+
+        event = adapter._run_streams[run_id].get_nowait()
+        assert event["event"] == "progress.notice"
+        assert event["kind"] == "thinking"
+        assert "message" not in event
+        assert adapter._run_streams[run_id].empty()
+        assert "SECRET" not in repr(event)
+        assert "text" not in event and "preview" not in event
+
+    @pytest.mark.asyncio
+    async def test_runs_wires_interim_callback_and_ignores_already_streamed(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                agent = MagicMock()
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+                def run_conversation(**_kwargs):
+                    callback = create_agent.call_args.kwargs["interim_assistant_callback"]
+                    callback("I will inspect https://user:SECRET@example.test/x", already_streamed=True)
+                    callback("<think>private</think>Then continue", already_streamed=False)
+                    return {"final_response": "done"}
+
+                agent.run_conversation.side_effect = run_conversation
+                create_agent.return_value = agent
+                started = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await started.json())["run_id"]
+                for _ in range(30):
+                    if adapter._run_statuses[run_id]["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+
+        queued = []
+        while not adapter._run_streams[run_id].empty():
+            queued.append(adapter._run_streams[run_id].get_nowait())
+        commentary = [event for event in queued if isinstance(event, dict) and event["event"] == "assistant.commentary"]
+        assert [event["text"] for event in commentary] == [
+            "I will inspect [redacted-url]",
+            "Then continue",
+        ]
+        assert [event["seq"] for event in commentary] == sorted(event["seq"] for event in commentary)
+        assert "SECRET" not in repr(commentary)
+
+    @pytest.mark.asyncio
+    async def test_assistant_commentary_is_callback_only_safe_and_sequenced(self, adapter):
+        run_id = "run-commentary"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        loop = asyncio.get_running_loop()
+        started, _ = adapter._make_run_tool_callbacks(run_id, loop)
+
+        # The projection intentionally receives only public interim callback
+        # text; reasoning/progress and ordinary message deltas have distinct
+        # transports and cannot manufacture commentary.
+        commentary = lambda text, already_streamed=False: (
+            adapter._emit_run_event(run_id, {
+                "event": "assistant.commentary", "run_id": run_id,
+                "timestamp": 1, "text": adapter._public_assistant_commentary(text),
+            }, loop)
+            if adapter._public_assistant_commentary(text) is not None else False
+        )
+        commentary("I will inspect https://user:SECRET@example.test/x at /private/SECRET\\napi_key=SECRET", already_streamed=True)
+        started("call-commentary", "read_file", {"path": "/private/file.txt"})
+        await asyncio.sleep(0)
+        events = [adapter._run_streams[run_id].get_nowait() for _ in range(2)]
+
+        assert [event["event"] for event in events] == ["assistant.commentary", "tool.started"]
+        assert events[0]["seq"] < events[1]["seq"]
+        assert "[redacted-url]" in events[0]["text"]
+        assert "[redacted-path]" in events[0]["text"]
+        assert "SECRET" not in repr(events[0])
+
+    def test_commentary_rejects_private_tags_and_enforces_bounds(self, adapter):
+        assert adapter._public_assistant_commentary("<think>private</think>Visible") == "Visible"
+        assert adapter._public_assistant_commentary("Visible <scratchpad>") is None
+        assert adapter._public_assistant_commentary("<memory-context>private</memory-context>") is None
+        bounded = adapter._public_assistant_commentary("😀" * 2_000 + "\nextra" * 20)
+        assert bounded is not None
+        assert len(bounded) <= 1_000
+        assert len(bounded.encode("utf-8")) <= 4_096
+        assert len(bounded.splitlines()) <= 8
+
+    @pytest.mark.parametrize(
+        "uri",
+        (
+            "http://user:secret@example.test/a?q=secret",
+            "https://user:secret@example.test/a?q=secret",
+            "ws://user:secret@example.test/a?q=secret",
+            "wss://user:secret@example.test/a?q=secret",
+            "ftp://user:secret@example.test/a?q=secret",
+            "file://user:secret@example.test/a?q=secret",
+            "custom+scheme://user:secret@example.test/a?q=secret",
+        ),
+    )
+    def test_commentary_redacts_all_uri_schemes(self, adapter, uri):
+        sanitized = adapter._public_assistant_commentary(f"Проверяю {uri} сейчас")
+        assert sanitized == "Проверяю [redacted-url] сейчас"
+        assert "secret" not in sanitized
+
+    def test_commentary_redacts_separator_prefixed_absolute_paths_and_keeps_safe_prose(self, adapter):
+        sanitized = adapter._public_assistant_commentary(
+            r"Проверяю path=/secret и (/home/a), файл:/etc/passwd, path=C:\Users\x, (\\server\share). a/b готово."
+        )
+        assert sanitized == (
+            "Проверяю path=[redacted-path] и ([redacted-path]), файл:[redacted-path], "
+            "path=[redacted-path], ([redacted-path]). a/b готово."
+        )
+        assert adapter._public_assistant_commentary(
+            "[redacted-url] и [redacted-path] — безопасные метки; обычная русская проза разрешена."
+        ) is not None
+
+    def test_goals_and_commentary_force_shared_secret_redaction(self, adapter):
+        with patch("gateway.platforms.api_server.redact_sensitive_text", side_effect=lambda text, **kwargs: text) as redactor:
+            assert adapter._public_agent_goal("Review token=RAW_SECRET") is not None
+            assert adapter._public_assistant_commentary("Check token=RAW_SECRET") is not None
+        assert [call.kwargs.get("force") for call in redactor.call_args_list] == [True, True]
+
+    def test_public_goal_is_multiline_bounded_and_rejects_private_payloads(self, adapter):
+        raw = "\n".join(f"step {index}: review 😀" for index in range(100))
+        projected = adapter._public_agent_goal(raw)
+        assert projected is not None
+        goal, truncated = projected
+        assert truncated is True
+        assert len(goal) <= 8_000
+        assert len(goal.encode("utf-8")) <= 32 * 1024
+        assert len(goal.splitlines()) == 80
+        assert adapter._public_agent_goal("safe <think>private</think> goal") is None
+        assert adapter._public_agent_goal("safe [reasoning]private[/reasoning] goal") is None
+        assert adapter._public_agent_goal("safe <memory>private</memory> goal") is None
+        assert adapter._public_agent_goal("safe\x01goal") == ("safe goal", False)
+        assert adapter._public_agent_goal("safe\u202egoal") == ("safe goal", False)
+
+    def test_public_goal_multibyte_byte_boundary_is_utf8_safe_and_deterministic(self, adapter, monkeypatch):
+        monkeypatch.setattr(APIServerAdapter, "_PUBLIC_AGENT_GOAL_MAX_BYTES", 13)
+        monkeypatch.setattr(APIServerAdapter, "_PUBLIC_AGENT_GOAL_MAX_LENGTH", 99)
+        first = adapter._public_agent_goal("😀😀😀😀")
+        second = adapter._public_agent_goal("😀😀😀😀")
+        assert first == second == ("😀😀😀", True)
+
+    @pytest.mark.asyncio
+    async def test_sequencer_orders_mixed_producers_and_rejects_late_callbacks(self, adapter):
+        run_id = "run-sequenced"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        loop = asyncio.get_running_loop()
+        started, completed = adapter._make_run_tool_callbacks(run_id, loop)
+
+        # An executor-thread callback is scheduled before loop-thread producers.
+        worker = threading.Thread(target=started, args=("call_1", "read_file", {"path": "/private/a.txt"}))
+        worker.start()
+        worker.join()
+        adapter._emit_run_event(run_id, {
+            "event": "message.delta", "run_id": run_id, "timestamp": 1, "delta": "ok",
+        })
+        completed("call_1", "read_file", {"path": "/private/a.txt"}, "private result")
+        adapter._emit_run_event(run_id, {
+            "event": "run.completed", "run_id": run_id, "timestamp": 2, "output": "done", "usage": {},
+        })
+        adapter._close_run_event_emitter(run_id)
+        started("call_late", "read_file", {"path": "/private/late.txt"})
+        await asyncio.sleep(0)
+
+        queued = [queue.get_nowait() for _ in range(5)]
+        events = queued[:-1]
+        assert [event["seq"] for event in events] == [1, 2, 3, 4]
+        assert [event["event"] for event in events] == [
+            "tool.started", "message.delta", "tool.completed", "run.completed",
+        ]
+        assert events[0]["tool_call_id"] == events[2]["tool_call_id"] == "call_1"
+        assert events[-1]["event"] == "run.completed"
+        assert queued[-1] is None
+        assert queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/clarification — resolve structured clarification
+# ---------------------------------------------------------------------------
+
+
+class TestRunClarification:
+    @pytest.mark.asyncio
+    async def test_clarification_response_is_run_scoped_and_emits_no_user_text(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_clarify"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_clarification"}
+        adapter._run_clarification_ids[run_id] = {"clarify-1"}
+        adapter._run_streams[run_id] = asyncio.Queue()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve:
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/clarification",
+                    json={"clarification_id": "clarify-1", "response": "production"},
+                )
+
+        assert response.status == 200
+        resolve.assert_called_once_with("clarify-1", "production")
+        await asyncio.sleep(0)
+        event = adapter._run_streams[run_id].get_nowait()
+        assert event["event"] == "clarification.responded"
+        assert event["clarification_id"] == "clarify-1"
+        assert "response" not in event
+
+    @pytest.mark.asyncio
+    async def test_clarification_response_rejects_id_owned_by_another_run(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._run_statuses["run-a"] = {"run_id": "run-a", "status": "waiting_for_clarification"}
+        adapter._run_clarification_ids["run-a"] = {"clarify-a"}
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run-a/clarification",
+                json={"clarification_id": "clarify-b", "response": "nope"},
+            )
+
+        assert response.status == 409
+
+
+@pytest.mark.asyncio
+async def test_subagent_lifecycle_is_per_agent_redacted_and_bounded(adapter):
+    run_id = "run-background"
+    adapter._run_streams[run_id] = asyncio.Queue()
+    adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+    callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+
+    secret_goal = "Audit https://token:SECRET@example.test/a at /private/SECRET and C:\\secret\\x; api_key=SECRET\nnext"
+    callback(
+        "subagent.start", preview="private preview", subagent_id="raw-child-a", child_session_id="raw-session",
+        task_index=0, task_count=2, goal=secret_goal, tool_count=1,
+    )
+    callback(
+        "subagent.tool", subagent_id="raw-child-b", task_index=1, task_count=2,
+        goal="B", tool_count=2, context="SECRET", result="SECRET", model="private-model",
+    )
+    callback(
+        "subagent.complete", subagent_id="raw-child-a", task_index=0, task_count=2,
+        goal=secret_goal, tool_count=3, status="timeout", duration_seconds=4.5,
+    )
+    # Invalid identities and bounds fail closed rather than creating an uncorrelated card.
+    callback("subagent.start", child_session_id="raw-session", task_index=0, task_count=1, goal="SECRET")
+    callback("subagent.start", subagent_id="bad", task_index=100, task_count=101, goal="SECRET")
+    await asyncio.sleep(0)
+
+    events = [adapter._run_streams[run_id].get_nowait() for _ in range(3)]
+    assert [event["status"] for event in events] == ["running", "running", "failed"]
+    assert events[0]["agent_id"] == events[2]["agent_id"] != events[1]["agent_id"]
+    assert events[0]["task_index"] == 0 and events[1]["task_index"] == 1
+    assert events[0]["task_count"] == events[1]["task_count"] == 2
+    assert events[2]["tool_count"] == 3 and events[2]["duration"] == 4.5
+    assert len(events[0]["goal"]) <= 8_000
+    assert len(events[0]["goal"].encode("utf-8")) <= 32 * 1024
+    assert events[0]["goal_truncated"] is False
+    public = repr(events)
+    for forbidden in (
+        "SECRET", "raw-child", "raw-session", "private preview", "private-model", "context", "result", "/private/", "C:\\\\secret",
+    ):
+        assert forbidden not in public
+    assert adapter._run_streams[run_id].empty()
+
+
+@pytest.mark.asyncio
+async def test_subagent_projection_uses_run_scoped_hmac_and_strict_sanitizers(adapter):
+    child_id = "raw-child-customer-ida"
+    raw_hash = hashlib.sha256(child_id.encode()).hexdigest()[:32]
+    base = {
+        "subagent_id": child_id,
+        "task_index": 0,
+        "task_count": 1,
+        "tool_count": 0,
+    }
+    first = adapter._public_background_event("run-hmac-a", "subagent.start", base)
+    same = adapter._public_background_event("run-hmac-a", "subagent.tool", base)
+    other_run = adapter._public_background_event("run-hmac-b", "subagent.start", base)
+    interrupted = adapter._public_background_event(
+        "run-hmac-a", "subagent.complete", {**base, "status": "interrupted", "duration_seconds": 2},
+    )
+    nonterminal = adapter._public_background_event(
+        "run-hmac-a", "subagent.tool", {**base, "status": "failed", "duration_seconds": 2},
+    )
+
+    assert first and same and other_run and interrupted and nonterminal
+    assert first["agent_id"] == same["agent_id"] != other_run["agent_id"]
+    assert re.fullmatch(r"agent_[A-Za-z0-9_-]{24}", first["agent_id"])
+    assert child_id not in first["agent_id"] and raw_hash not in first["agent_id"]
+    assert interrupted["status"] == "failed"
+    assert nonterminal["status"] == "running" and "duration" not in nonterminal
+
+    secret_goal = (
+        "\U0001f600" * 200
+        + " https://user:RAW_URL_SECRET@example.test/private "
+        + "/private/RAW_PATH_SECRET Authorization: Bearer RAW_AUTH_SECRET "
+        + "Cookie=RAW_COOKIE_SECRET token=RAW_TOKEN_SECRET"
+    )
+    goal_event = adapter._public_background_event(
+        "run-hmac-a", "subagent.start", {**base, "goal": secret_goal},
+    )
+    assert goal_event and "goal" in goal_event
+    goal = goal_event["goal"]
+    assert len(goal) <= 8_000 and len(goal.encode("utf-8")) <= 32 * 1024
+    assert goal_event["goal_truncated"] is False
+    for private in ("RAW_URL_SECRET", "RAW_PATH_SECRET", "RAW_AUTH_SECRET", "RAW_COOKIE_SECRET", "RAW_TOKEN_SECRET", "https://", "/private/"):
+        assert private not in goal
+    sensitive_goal = adapter._public_agent_goal(
+        "Visit https://user:RAW_URL_SECRET@example.test/a at /private/RAW_PATH_SECRET; "
+        "Authorization: Bearer RAW_AUTH_SECRET Cookie=RAW_COOKIE_SECRET token=RAW_TOKEN_SECRET"
+    )
+    assert sensitive_goal is not None
+    sensitive_goal, sensitive_goal_truncated = sensitive_goal
+    assert sensitive_goal_truncated is False
+    for private in ("RAW_URL_SECRET", "RAW_PATH_SECRET", "RAW_AUTH_SECRET", "RAW_COOKIE_SECRET", "RAW_TOKEN_SECRET", "https://", "/private/"):
+        assert private not in sensitive_goal
+
+    code = "# customer name must vanish\ncustomer_name = 123\nread_file('RAW_LITERAL')\nresult = json.loads('RAW')\n"
+    preview = adapter._public_execute_code_preview(code)
+    assert preview is not None
+    skeleton, truncated = preview
+    assert not truncated
+    assert "customer_name" not in skeleton and "result" not in skeleton
+    assert "RAW_LITERAL" not in skeleton and "123" not in skeleton and "customer name" not in skeleton
+    assert "read_file" in skeleton and "json" in skeleton
+    assert adapter._public_execute_code_preview("broken = 'unterminated") is None
+    assert adapter._public_execute_code_preview("x = 1\x00") is None
 
 
 # ---------------------------------------------------------------------------
