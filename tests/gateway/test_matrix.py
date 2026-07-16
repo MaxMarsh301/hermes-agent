@@ -4559,9 +4559,15 @@ class TestMatrixDmAutoThread:
         assert thread_id == "$ev1"
 
     @pytest.mark.asyncio
-    async def test_dm_auto_thread_disabled_no_thread(self):
-        """When dm_auto_thread is False (default), DMs have no auto-thread."""
-        self.adapter._dm_auto_thread = False
+    async def test_dm_auto_thread_disabled_no_thread(self, monkeypatch):
+        """Without an explicit opt-in, DMs have no auto-thread."""
+        monkeypatch.delenv("MATRIX_DM_AUTO_THREAD", raising=False)
+        self.adapter = _make_adapter()
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._require_mention = False
+        assert self.adapter._dm_auto_thread is False
 
         ctx = await self.adapter._resolve_message_context(
             room_id="!dm:ex",
@@ -4575,6 +4581,21 @@ class TestMatrixDmAutoThread:
         assert ctx is not None
         _body, _is_dm, _chat_type, thread_id, _display, _source = ctx
         assert thread_id is None
+
+    def test_dm_auto_thread_explicit_config_opt_in(self, monkeypatch):
+        """An explicit config extra preserves the DM-threading opt-in."""
+        monkeypatch.delenv("MATRIX_DM_AUTO_THREAD", raising=False)
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "dm_auto_thread": True,
+            },
+        )
+
+        assert type(self.adapter)(config)._dm_auto_thread is True
 
 
 

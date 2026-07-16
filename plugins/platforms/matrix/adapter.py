@@ -929,9 +929,7 @@ class MatrixAdapter(BasePlatformAdapter):
             "1",
             "yes",
         )
-        self._dm_auto_thread: bool = os.getenv(
-            "MATRIX_DM_AUTO_THREAD", "false"
-        ).lower() in {"true", "1", "yes"}
+        self._dm_auto_thread = self._parse_dm_auto_thread(config)
         self._dm_mention_threads: bool = os.getenv(
             "MATRIX_DM_MENTION_THREADS", "false"
         ).lower() in ("true", "1", "yes")
@@ -1067,6 +1065,21 @@ class MatrixAdapter(BasePlatformAdapter):
         return os.getenv(
             "MATRIX_THREAD_REQUIRE_MENTION", "false"
         ).lower() in {"true", "1", "yes", "on"}
+
+    @staticmethod
+    def _parse_dm_auto_thread(config) -> bool:
+        """Parse the explicit DM threading opt-in from config or environment."""
+        env_value = os.getenv("MATRIX_DM_AUTO_THREAD")
+        if env_value is not None:
+            return env_value.strip().lower() in {"true", "1", "yes", "on"}
+        configured = config.extra.get("dm_auto_thread")
+        if configured is not None:
+            if isinstance(configured, bool):
+                return configured
+            if isinstance(configured, str):
+                return configured.strip().lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return False
 
     # ------------------------------------------------------------------
     # E2EE helpers
@@ -4862,11 +4875,16 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
     if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
-    if "dm_auto_thread" in matrix_cfg and not os.getenv("MATRIX_DM_AUTO_THREAD"):
-        os.environ["MATRIX_DM_AUTO_THREAD"] = str(matrix_cfg["dm_auto_thread"]).lower()
+    adapter_extra = {}
+    if "dm_auto_thread" in matrix_cfg:
+        # Keep the explicit YAML choice on PlatformConfig.extra as well as the
+        # legacy environment bridge. Absent configuration remains default-off.
+        adapter_extra["dm_auto_thread"] = matrix_cfg["dm_auto_thread"]
+        if not os.getenv("MATRIX_DM_AUTO_THREAD"):
+            os.environ["MATRIX_DM_AUTO_THREAD"] = str(matrix_cfg["dm_auto_thread"]).lower()
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
-    return None
+    return adapter_extra or None
 
 
 def _is_connected(config) -> bool:
