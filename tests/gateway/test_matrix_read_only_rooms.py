@@ -91,6 +91,6 @@ def test_matrix_yaml_bridge_exports_read_only_and_dm_auto_thread(monkeypatch):
         },
     )
 
-    assert result is None
+    assert result == {"dm_auto_thread": True}
     assert os.getenv("MATRIX_READ_ONLY_ROOMS") == "!readonly:example.org,!other:example.org"
     assert os.getenv("MATRIX_DM_AUTO_THREAD") == "true"
