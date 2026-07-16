@@ -45,8 +45,9 @@ class TestHermesApiServerToolset:
             assert tool in tools, f"Missing HA tool: {tool}"
 
     def test_toolset_excludes_clarify(self):
+        """The Runs contract intentionally exposes clarify through this toolset."""
         tools = resolve_toolset("hermes-api-server")
-        assert "clarify" not in tools
+        assert "clarify" in tools
 
     def test_toolset_excludes_send_message(self):
         tools = resolve_toolset("hermes-api-server")
