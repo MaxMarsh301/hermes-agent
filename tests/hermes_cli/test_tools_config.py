@@ -1350,7 +1350,7 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
         "_test_platform": {"label": "Test", "default_toolset": "hermes-_test_platform"},
     }
 
-    def resolve_fake_toolset(name, visited=None):
+    def resolve_fake_toolset(name, visited=None, **_kwargs):
         visited = set() if visited is None else visited
         if name in visited or name not in fake_toolsets:
             return []

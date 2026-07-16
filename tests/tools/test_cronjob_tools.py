@@ -550,10 +550,20 @@ class TestUnifiedCronjobTool:
         spec.loader.exec_module(module)
         return module
 
+    def _seed_fake_anton_env(self, monkeypatch):
+        """Opt into fake ANTON credentials after global hermetic env stripping."""
+        monkeypatch.setenv("ANTON_GATEWAY_ENABLED", "true")
+        monkeypatch.setenv("ANTON_GATEWAY_URL", "https://gateway.example")
+        monkeypatch.setenv("ANTON_RESOLVER_KEY_ID", "resolver-test")
+        monkeypatch.setenv("ANTON_RESOLVER_SECRET", "resolver-secret")
+        monkeypatch.setenv("ANTON_CRON_DELIVERY_KEY_ID", "delivery-test")
+        monkeypatch.setenv("ANTON_CRON_DELIVERY_SECRET", "delivery-secret")
+
     def test_create_and_update_resolve_anton_human_reference(self, monkeypatch):
         """Only resolver-confirmed references reach persistence as conversations."""
         import sys
 
+        self._seed_fake_anton_env(monkeypatch)
         plugin = self._load_anton_plugin()
         client = sys.modules[plugin.__name__ + ".client"]
         calls = []
@@ -609,6 +619,7 @@ class TestUnifiedCronjobTool:
         "anton:project_gateway/conversation_0123456789abcdef0123456789abcdef",
     ])
     def test_anton_project_only_and_resolver_errors_are_rejected(self, monkeypatch, deliver):
+        self._seed_fake_anton_env(monkeypatch)
         plugin = self._load_anton_plugin()
         import sys
 
@@ -642,6 +653,7 @@ class TestUnifiedCronjobTool:
         """Usable-looking IDs cannot override a non-resolved Gateway outcome."""
         import sys
 
+        self._seed_fake_anton_env(monkeypatch)
         plugin = self._load_anton_plugin()
         client = sys.modules[plugin.__name__ + ".client"]
 

@@ -99,8 +99,16 @@ def test_config_uses_gateway_authoritative_env_names_and_fails_closed(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_adapter_is_instantiable_and_returns_minimal_chat_info():
+async def test_adapter_is_instantiable_and_returns_minimal_chat_info(monkeypatch):
     """Plugin registration must precede construction of its dynamic Platform."""
+    # tests/conftest.py deliberately strips credential-shaped variables. Seed
+    # this feature test's fake credentials locally; do not weaken that fixture.
+    monkeypatch.setenv("ANTON_GATEWAY_ENABLED", "true")
+    monkeypatch.setenv("ANTON_GATEWAY_URL", "https://gateway.example")
+    monkeypatch.setenv("ANTON_RESOLVER_KEY_ID", "resolver-test")
+    monkeypatch.setenv("ANTON_RESOLVER_SECRET", "resolver-secret")
+    monkeypatch.setenv("ANTON_CRON_DELIVERY_KEY_ID", "delivery-test")
+    monkeypatch.setenv("ANTON_CRON_DELIVERY_SECRET", "delivery-secret")
     plugin = load_plugin()
     from gateway.config import Platform
     from gateway.platform_registry import PlatformEntry, platform_registry
