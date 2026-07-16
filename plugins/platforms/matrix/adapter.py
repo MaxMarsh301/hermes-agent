@@ -40,6 +40,9 @@ Environment variables:
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
     MATRIX_READ_ONLY_ROOMS      Comma-separated room IDs to observe silently without replies
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
+    MATRIX_PLAINTEXT_OUTGOING   Explicitly send m.room.message plaintext (default: false)
+    MATRIX_ROOM_KEY_REQUEST_TIMEOUT
+                              Missing Megolm-key recovery timeout in seconds (clamped 1–30; default: 20)
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
     MATRIX_ALLOW_PUBLIC_ROOMS   Allow Matrix tools to create public rooms (default: false)
     MATRIX_APPROVAL_REQUIRE_SENDER
@@ -58,7 +61,7 @@ import mimetypes
 import os
 import re
 import time
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 
 from html import escape as _html_escape
@@ -846,6 +849,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
         self._processed_events: deque = deque(maxlen=1000)
         self._processed_events_set: set = set()
+        # Avoid racing duplicate room-key requests from one sync batch.  The
+        # tuple deliberately contains only protocol identifiers, never keys.
+        self._megolm_key_requests_in_flight: set[tuple[str, str, str]] = set()
 
         # Buffer for undecrypted events pending key receipt.
         # Each entry: (room_id, event, timestamp)
@@ -1478,6 +1484,14 @@ class MatrixAdapter(BasePlatformAdapter):
             self._on_room_message,
             wait_sync=True,
         )
+        # The default decryption dispatcher drops events when their Megolm
+        # session is absent. This handler requests that session and retries
+        # the original event without changing normal encrypted-room handling.
+        client.add_event_handler(
+            EventType.ROOM_ENCRYPTED,
+            self._on_room_encrypted_missing_key,
+            wait_sync=True,
+        )
         client.add_event_handler(
             EventType.REACTION,
             self._on_reaction,
@@ -1589,6 +1603,57 @@ class MatrixAdapter(BasePlatformAdapter):
 
         logger.info("Matrix: disconnected")
 
+    @staticmethod
+    def _plaintext_outgoing_enabled() -> bool:
+        """Return whether the explicitly opt-in plaintext send escape hatch is set."""
+        return os.getenv("MATRIX_PLAINTEXT_OUTGOING", "").strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
+    async def _send_room_message_event(
+        self, room_id: str, event_type: Any, msg_content: Dict[str, Any]
+    ) -> Any:
+        """Send a room event, bypassing E2EE only for opted-in text events.
+
+        The normal mautrix path remains the default and is used for all
+        non-message events. The direct Client-Server API request is required
+        because ``send_message_event`` encrypts messages for encrypted rooms.
+        """
+        event_type_value = (
+            event_type.serialize() if hasattr(event_type, "serialize") else str(event_type)
+        )
+        if self._plaintext_outgoing_enabled() and event_type_value == "m.room.message":
+            api = getattr(self._client, "api", None)
+            request = getattr(api, "request", None)
+            get_txn_id = getattr(api, "get_txn_id", None)
+            if api is not None and inspect.iscoroutinefunction(request) and callable(get_txn_id):
+                try:
+                    from mautrix.api import Method
+
+                    method = Method.PUT
+                except ImportError:
+                    # Lightweight test clients and older mautrix shims may not
+                    # export Method; the client-server API accepts this verb.
+                    method = "PUT"
+
+                txn_id = get_txn_id()
+                path = (
+                    f"/_matrix/client/v3/rooms/{quote(str(room_id), safe='')}"
+                    f"/send/{quote(event_type_value, safe='')}/{quote(str(txn_id), safe='')}"
+                )
+                response = await request(
+                    method,
+                    path,
+                    msg_content,
+                    metrics_method="send_plain_room_message",
+                )
+                return response.get("event_id", "") if isinstance(response, dict) else response
+
+        return await self._client.send_message_event(RoomID(room_id), event_type, msg_content)
+
     async def send(
         self,
         chat_id: str,
@@ -1612,8 +1677,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
             try:
                 event_id = await asyncio.wait_for(
-                    self._client.send_message_event(
-                        RoomID(chat_id),
+                    self._send_room_message_event(
+                        chat_id,
                         EventType.ROOM_MESSAGE,
                         msg_content,
                     ),
@@ -1627,8 +1692,8 @@ class MatrixAdapter(BasePlatformAdapter):
                     try:
                         await self._client.crypto.share_keys()
                         event_id = await asyncio.wait_for(
-                            self._client.send_message_event(
-                                RoomID(chat_id),
+                            self._send_room_message_event(
+                                chat_id,
                                 EventType.ROOM_MESSAGE,
                                 msg_content,
                             ),
@@ -1753,8 +1818,8 @@ class MatrixAdapter(BasePlatformAdapter):
         }
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
+            event_id = await self._send_room_message_event(
+                chat_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
@@ -2232,8 +2297,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(room_id),
+            event_id = await self._send_room_message_event(
+                room_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
@@ -2470,6 +2535,86 @@ class MatrixAdapter(BasePlatformAdapter):
                 exc,
             )
             return False
+
+    async def _on_room_encrypted_missing_key(self, event: Any) -> None:
+        """Boundedly request an absent Megolm session and retry its event.
+
+        This is intentionally best-effort: malformed events, unavailable
+        crypto, failed requests, and failed redispatches are all dropped. Do
+        not log session IDs, sender keys, event payloads, or exception text:
+        those values may be sensitive and this recovery must not turn a key
+        problem into a log disclosure.
+        """
+        client = self._client
+        crypto = getattr(client, "crypto", None) if client else None
+        if not client or not crypto:
+            return
+
+        room_id = str(getattr(event, "room_id", "") or "")
+        sender = str(getattr(event, "sender", "") or "")
+        content = getattr(event, "content", None)
+        session_id = str(getattr(content, "session_id", "") or "")
+        sender_key = str(getattr(content, "sender_key", "") or "")
+        sender_device = str(getattr(content, "device_id", "") or "")
+        if not room_id or not sender or not session_id or not sender_key:
+            return
+
+        request_key = (room_id, sender_key, session_id)
+        if request_key in self._megolm_key_requests_in_flight:
+            return
+        self._megolm_key_requests_in_flight.add(request_key)
+        try:
+            try:
+                if await crypto.crypto_store.has_group_session(room_id, session_id):
+                    return
+            except Exception:
+                logger.debug("Matrix: unable to inspect missing Megolm session")
+                return
+
+            devices: list[str] = [sender_device] if sender_device else []
+            try:
+                response = await client.query_keys({UserID(sender): []})
+                device_keys = getattr(response, "device_keys", None) or {}
+                device_map = device_keys.get(UserID(sender), device_keys.get(sender, {}))
+                for device_id in (device_map or {}):
+                    device_id = str(device_id)
+                    if device_id not in devices:
+                        devices.append(device_id)
+            except Exception:
+                logger.debug("Matrix: unable to discover devices for missing Megolm session")
+            if not devices:
+                return
+
+            try:
+                timeout = float(os.getenv("MATRIX_ROOM_KEY_REQUEST_TIMEOUT", "20"))
+            except ValueError:
+                timeout = 20.0
+            # A local configuration mistake must not create unbounded sync work.
+            timeout = min(30.0, max(1.0, timeout))
+
+            try:
+                got_key = await crypto.request_room_key(
+                    RoomID(room_id),
+                    sender_key,
+                    session_id,
+                    {UserID(sender): {device_id: True for device_id in devices}},
+                    timeout=timeout,
+                )
+            except Exception:
+                logger.debug("Matrix: missing Megolm key request failed")
+                return
+            if not got_key:
+                return
+
+            try:
+                decrypted = await crypto.decrypt_megolm_event(event)
+                dispatched = client.dispatch_event(decrypted, getattr(event, "source", None))
+                if inspect.isawaitable(dispatched):
+                    await dispatched
+            except Exception:
+                logger.debug("Matrix: recovered Megolm event could not be dispatched")
+        finally:
+            self._megolm_key_requests_in_flight.discard(request_key)
 
     async def _on_room_message(self, event: Any) -> None:
         """Handle incoming room message events (text, media)."""
@@ -3756,8 +3901,8 @@ class MatrixAdapter(BasePlatformAdapter):
         msg_content = self._build_text_message_content(text, msgtype=msgtype)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
+            event_id = await self._send_room_message_event(
+                chat_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
