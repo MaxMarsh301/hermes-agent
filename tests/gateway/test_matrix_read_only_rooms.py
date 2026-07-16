@@ -80,8 +80,10 @@ async def test_matrix_read_only_room_drops_before_mention_free_room_or_thread_lo
 
 
 def test_matrix_yaml_bridge_exports_read_only_and_dm_auto_thread(monkeypatch):
+    # Register absent keys with monkeypatch before the legacy bridge assigns
+    # directly to os.environ, so fixture teardown restores their absence.
     for key in ("MATRIX_READ_ONLY_ROOMS", "MATRIX_DM_AUTO_THREAD"):
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "")
 
     result = _apply_yaml_config(
         {},
