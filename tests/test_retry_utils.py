@@ -60,6 +60,20 @@ def test_backoff_with_extreme_attempt_returns_max():
     assert delay == 120.0
 
 
+def test_backoff_rejects_non_finite_policy_values():
+    for value in (float("nan"), float("inf"), float("-inf")):
+        delay = jittered_backoff(2, base_delay=value, max_delay=value, jitter_ratio=value)
+        assert delay == 120.0
+        assert retry_utils.math.isfinite(delay)
+
+
+def test_backoff_invalid_jitter_still_returns_finite_positive_delay():
+    for value in (float("nan"), float("inf"), float("-inf"), -1.0):
+        delay = jittered_backoff(1, base_delay=5.0, max_delay=60.0, jitter_ratio=value)
+        assert delay == 5.0
+        assert retry_utils.math.isfinite(delay)
+
+
 def test_backoff_negative_attempt_treated_as_one():
     """Negative attempt should not crash and behaves like attempt=1."""
     delay = jittered_backoff(-5, base_delay=10.0, max_delay=120.0, jitter_ratio=0.0)

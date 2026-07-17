@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -6240,16 +6241,24 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
+    try:
+        safe_default = float(default)
+    except (TypeError, ValueError, OverflowError):
+        safe_default = _DEFAULT_AUX_TIMEOUT
+    if not math.isfinite(safe_default) or safe_default <= 0:
+        safe_default = _DEFAULT_AUX_TIMEOUT
     if not task:
-        return default
+        return safe_default
     task_config = _get_auxiliary_task_config(task)
     raw = task_config.get("timeout")
     if raw is not None:
         try:
-            return float(raw)
-        except (ValueError, TypeError):
+            parsed = float(raw)
+            if math.isfinite(parsed) and parsed > 0:
+                return parsed
+        except (ValueError, TypeError, OverflowError):
             pass
-    return default
+    return safe_default
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
@@ -6264,6 +6273,12 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     and it is a minimum (``max``), so a config value already above it is kept.
     """
     effective = timeout if timeout is not None else _get_task_timeout(task)
+    try:
+        effective = float(effective)
+    except (TypeError, ValueError, OverflowError):
+        effective = _get_task_timeout(task)
+    if not math.isfinite(effective) or effective <= 0:
+        effective = _get_task_timeout(task)
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
     return effective
