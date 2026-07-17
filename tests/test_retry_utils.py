@@ -5,7 +5,17 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import adaptive_rate_limit_backoff, bounded_retry_after, is_zai_coding_overload_error, jittered_backoff
+
+
+def test_bounded_retry_after_rejects_non_finite_and_invalid_values():
+    for value in (float("inf"), float("-inf"), float("nan"), "Infinity", "NaN", -1, 0, None, True):
+        assert bounded_retry_after(value) is None
+
+
+def test_bounded_retry_after_caps_finite_values():
+    assert bounded_retry_after("12.5") == 12.5
+    assert bounded_retry_after(900, maximum=600) == 600.0
 
 
 def test_backoff_is_exponential():

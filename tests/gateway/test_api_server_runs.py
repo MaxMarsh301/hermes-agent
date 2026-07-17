@@ -23,7 +23,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _RunEventBuffer,
     _approval_event_choices,
+    _public_approval_request,
     cors_middleware,
     security_headers_middleware,
 )
@@ -38,10 +40,10 @@ from tools import approval as approval_mod
 @pytest.mark.parametrize(
     ("smart_denied", "allow_permanent", "expected"),
     [
-        (False, True, ["once", "session", "always", "deny"]),
+        (False, True, ["once", "session", "deny"]),
         (False, False, ["once", "session", "deny"]),
-        (True, True, ["once", "deny"]),
-        (True, False, ["once", "deny"]),
+        (True, True, ["once", "session", "deny"]),
+        (True, False, ["once", "session", "deny"]),
     ],
 )
 def test_approval_event_choices_follow_backend_capabilities(
@@ -51,6 +53,66 @@ def test_approval_event_choices_follow_backend_capabilities(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
     ) == expected
+
+
+def test_public_approval_request_is_opaque_allowlisted_and_never_reflects_raw_metadata():
+    approval_id = "approval_" + "A" * 32
+    event = _public_approval_request({
+        "approval_id": approval_id,
+        "description": "<think>reasoning</think> curl https://token:SECRET@example.test /private/SECRET",
+        "pattern_key": "raw-rule",
+        "args": {"Authorization": "Bearer SECRET"},
+    })
+
+    assert event == {
+        "approvalId": approval_id,
+        "action": "terminal.command",
+        "summary": "Выполнить действие в терминале",
+        "purpose": "Подтвердить потенциально опасное действие для текущей задачи",
+        "riskCode": "other_dangerous_action",
+        "choices": ["once", "session", "deny"],
+    }
+    public = repr(event)
+    for private in ("SECRET", "sudo", "rm -rf", "/private/", "https://", "reasoning", "raw-rule", "args"):
+        assert private not in public
+
+
+def test_public_approval_command_preview_preserves_benign_and_dangerous_shell_structure():
+    approval_id = "approval_" + "A" * 32
+    benign = "printf '%s\\n' \"$HOME\" | sed -n '1p'\nprintf 'done'"
+    dangerous = "sudo rm -rf -- /tmp/target && echo done"
+
+    assert _public_approval_request({"approval_id": approval_id, "command": benign})["commandPreview"] == benign
+    assert _public_approval_request({"approval_id": approval_id, "command": dangerous})["commandPreview"] == dangerous
+
+
+def test_public_approval_command_preview_forces_credential_redaction():
+    command = "curl -H 'Authorization: Bearer sk-live-SECRET' https://example.test/api"
+    event = _public_approval_request({"approval_id": "approval_" + "A" * 32, "command": command})
+
+    preview = event["commandPreview"]
+    assert "sk-live-SECRET" not in preview
+    assert "Authorization: Bearer ***" in preview
+    assert "curl -H" in preview and "https://example.test/api" in preview
+
+
+def test_public_approval_command_preview_is_control_safe_utf8_bounded_and_truncated():
+    command = "\n".join(f"printf '界' # {index} " + "界" * 500 for index in range(13)) + "\x1b"
+    event = _public_approval_request({"approval_id": "approval_" + "A" * 32, "command": command})
+
+    preview = event["commandPreview"]
+    assert event["commandTruncated"] is True
+    assert len(preview.encode("utf-8")) <= 2048
+    assert len(preview.split("\n")) <= 12
+    assert "\x1b" not in preview
+    assert preview.encode("utf-8").decode("utf-8") == preview
+
+
+def test_public_approval_command_preview_omits_missing_or_empty_command():
+    for approval_data in ({"approval_id": "approval_" + "A" * 32}, {"approval_id": "approval_" + "A" * 32, "command": ""}):
+        event = _public_approval_request(approval_data)
+        assert "commandPreview" not in event
+        assert "commandTruncated" not in event
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -152,6 +214,44 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_first_turn_emits_generated_title_after_completion(self, adapter):
+        app = _create_runs_app(adapter)
+        with patch("agent.title_generator.generate_title", return_value="Диагностика шлюза") as generate:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    agent = MagicMock()
+                    agent.run_conversation.return_value = {"final_response": "Готовый ответ"}
+                    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+                    mock_create.return_value = agent
+
+                    first = await cli.post("/v1/runs", json={"input": "Почему упал шлюз?"})
+                    first_id = (await first.json())["run_id"]
+                    for _ in range(50):
+                        first_events = adapter._run_streams[first_id].events_after(0)
+                        if any(event.get("event") == "conversation.title" for event in first_events):
+                            break
+                        await asyncio.sleep(0.02)
+                    assert [event["event"] for event in first_events][-2:] == ["run.completed", "conversation.title"]
+                    assert first_events[-1]["title"] == "Диагностика шлюза"
+                    generate.assert_called_once_with("Почему упал шлюз?", "Готовый ответ")
+
+                    followup = await cli.post(
+                        "/v1/runs",
+                        json={"input": "Продолжай", "conversation_history": [{"role": "user", "content": "Первый вопрос"}]},
+                    )
+                    followup_id = (await followup.json())["run_id"]
+                    for _ in range(50):
+                        if adapter._run_statuses[followup_id]["status"] == "completed":
+                            break
+                        await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.05)
+                    assert not any(
+                        event.get("event") == "conversation.title"
+                        for event in adapter._run_streams[followup_id].events_after(0)
+                    )
+                    assert generate.call_count == 1
 
     @pytest.mark.asyncio
     async def test_start_invalid_json_returns_400(self, adapter):
@@ -432,6 +532,113 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_answer_replay_keeps_content_but_excludes_tool_results_and_provider_errors(self, adapter):
+        """Runs is bounded authenticated answer recovery, not a raw tool/provider trace."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                agent = MagicMock()
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+                def fail_with_private_provider_error(**_kwargs):
+                    started = create_agent.call_args.kwargs["tool_start_callback"]
+                    completed = create_agent.call_args.kwargs["tool_complete_callback"]
+                    started("call-1", "read_file", {"path": "/private/SECRET"})
+                    completed("call-1", "read_file", {"path": "/private/SECRET"}, "provider SECRET result")
+                    return {"failed": True, "error": "provider SECRET diagnostic"}
+
+                agent.run_conversation.side_effect = fail_with_private_provider_error
+                create_agent.return_value = agent
+                started = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await started.json())["run_id"]
+                for _ in range(30):
+                    if adapter._run_statuses[run_id]["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.02)
+
+        events = adapter._run_streams[run_id].events_after(0)
+        assert any(event["event"] == "run.failed" for event in events)
+        assert "provider SECRET" not in repr(events)
+        assert all("result" not in event for event in events)
+        assert all("error" not in event for event in events)
+
+    @pytest.mark.asyncio
+    async def test_events_reconnect_replays_then_continues_through_terminal_event(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_reconnect"
+        adapter._run_streams[run_id] = _RunEventBuffer(asyncio.get_running_loop(), max_events=8)
+        adapter._run_streams_created[run_id] = time.time()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+
+        adapter._emit_run_event(run_id, {"event": "run.started", "run_id": run_id})
+        await asyncio.sleep(0)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.get(f"/v1/runs/{run_id}/events")
+            assert b"run.started" in await first.content.readuntil(b"\n\n")
+            first.close()
+            await asyncio.sleep(0)
+            assert run_id in adapter._run_streams
+
+            adapter._emit_run_event(run_id, {"event": "run.completed", "run_id": run_id})
+            adapter._close_run_event_emitter(run_id)
+            await asyncio.sleep(0)
+            replay = await cli.get(f"/v1/runs/{run_id}/events")
+            body = await replay.text()
+
+        assert body.index("run.started") < body.index("run.completed")
+        assert ": stream closed" in body
+
+    @pytest.mark.asyncio
+    async def test_event_replay_retention_is_bounded_and_keeps_newest_events(self, adapter):
+        run_id = "run_bounded_replay"
+        adapter._run_streams[run_id] = _RunEventBuffer(asyncio.get_running_loop(), max_events=2)
+        adapter._emit_run_event(run_id, {"event": "run.started", "run_id": run_id})
+        adapter._emit_run_event(run_id, {"event": "tool.started", "run_id": run_id})
+        adapter._emit_run_event(run_id, {"event": "run.completed", "run_id": run_id})
+        await asyncio.sleep(0)
+
+        retained = adapter._run_streams[run_id].events_after(0)
+        assert [event["event"] for event in retained] == ["tool.started", "run.completed"]
+        assert [event["seq"] for event in retained] == [2, 3]
+
+    @pytest.mark.asyncio
+    async def test_event_buffer_coalesces_flood_wakes_and_leaves_no_task_after_close(self):
+        loop = asyncio.get_running_loop()
+        stream = _RunEventBuffer(loop, max_events=8)
+        for index in range(10_000):
+            stream.append({"seq": index})
+        wake = stream._notify_task
+        assert wake is not None
+        # A burst has one outstanding notifier, not a Task per event.
+        assert sum(task is wake for task in asyncio.all_tasks() if not task.done()) == 1
+        stream.close()
+        await asyncio.sleep(0)
+        assert stream._notify_task is None
+        assert wake.done()
+
+    @pytest.mark.asyncio
+    async def test_simultaneous_event_subscribers_receive_identical_ordered_events(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_fanout"
+        adapter._run_streams[run_id] = _RunEventBuffer(asyncio.get_running_loop(), max_events=8)
+        adapter._run_streams_created[run_id] = time.time()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+
+        async with TestClient(TestServer(app)) as cli:
+            left, right = await asyncio.gather(
+                cli.get(f"/v1/runs/{run_id}/events"),
+                cli.get(f"/v1/runs/{run_id}/events"),
+            )
+            adapter._emit_run_event(run_id, {"event": "tool.started", "run_id": run_id})
+            adapter._emit_run_event(run_id, {"event": "run.completed", "run_id": run_id})
+            adapter._close_run_event_emitter(run_id)
+            await asyncio.sleep(0)
+            left_body, right_body = await asyncio.gather(left.text(), right.text())
+
+        for body in (left_body, right_body):
+            assert body.index("tool.started") < body.index("run.completed")
+            assert ": stream closed" in body
 
 
     @pytest.mark.asyncio
@@ -452,7 +659,7 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"approvalId": "approval_" + "A" * 32, "choice": "once"},
                 )
                 assert approval_resp.status == 409
                 approval_data = await approval_resp.json()
@@ -462,29 +669,88 @@ class TestRunEvents:
                 }
 
     @pytest.mark.asyncio
-    async def test_approval_string_false_does_not_resolve_all(self, adapter):
-        """Quoted false must not fan out approval resolution across the queue."""
+    async def test_approval_requires_exact_pending_id_and_first_terminal_wins(self, adapter):
         app = _create_runs_app(adapter)
         run_id = "run_bool_parse"
+        approval_id = "approval_" + "A" * 32
         adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
         adapter._run_approval_sessions[run_id] = "session-123"
+        adapter._run_approval_ids[run_id] = {approval_id}
+        pending = approval_mod._ApprovalEntry({"approval_id": approval_id})
+        with approval_mod._lock:
+            approval_mod._gateway_queues["session-123"] = [pending]
 
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-                approval_resp = await cli.post(
-                    f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once", "all": "false"},
-                )
+            missing = await cli.post(f"/v1/runs/{run_id}/approval", json={"choice": "once"})
+            assert missing.status == 400
+            wrong = await cli.post(
+                f"/v1/runs/{run_id}/approval", json={"approvalId": "approval_" + "B" * 32, "choice": "once"}
+            )
+            assert wrong.status == 409
+            approval_resp = await cli.post(
+                f"/v1/runs/{run_id}/approval", json={"approvalId": approval_id, "choice": "deny"}
+            )
+            approval_data = await approval_resp.json()
+            duplicate = await cli.post(
+                f"/v1/runs/{run_id}/approval", json={"approvalId": approval_id, "choice": "once"}
+            )
 
         assert approval_resp.status == 200
-        mock_resolve.assert_called_once_with(
-            "session-123",
-            "once",
-            resolve_all=False,
-        )
+        assert approval_data["approvalId"] == approval_id
+        assert pending.result == "deny" and pending.event.is_set()
+        assert duplicate.status == 409
 
     @pytest.mark.asyncio
-    async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
+    async def test_actual_manager_emitted_approval_id_resolves_once_and_is_run_scoped(self, adapter):
+        """Runs accepts the exact opaque ID allocated and notified by approval.py."""
+        app = _create_runs_app(adapter)
+        run_id = "run_manager_allocated_id"
+        session_key = "manager-allocated-session"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[run_id] = session_key
+        adapter._run_approval_ids[run_id] = set()
+        emitted: dict[str, str] = {}
+        notified = threading.Event()
+        result: dict[str, object] = {}
+
+        def notify(approval_data):
+            public = _public_approval_request(approval_data)
+            assert public is not None
+            emitted.update(public)
+            adapter._run_approval_ids[run_id].add(public["approvalId"])
+            notified.set()
+
+        worker = threading.Thread(
+            target=lambda: result.update(
+                approval_mod._await_gateway_decision(
+                    session_key,
+                    notify,
+                    {"command": "danger", "description": "danger", "pattern_key": "danger"},
+                )
+            ),
+        )
+        worker.start()
+        assert notified.wait(timeout=3)
+        approval_id = emitted["approvalId"]
+        assert re.fullmatch(r"approval_[A-Za-z0-9_-]{32}", approval_id)
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/v1/runs/{run_id}/approval", json={"approvalId": approval_id, "choice": "deny"}
+            )
+            second = await cli.post(
+                f"/v1/runs/{run_id}/approval", json={"approvalId": approval_id, "choice": "once"}
+            )
+        worker.join(timeout=3)
+
+        assert first.status == 200
+        assert second.status == 409
+        assert not worker.is_alive()
+        assert result["resolved"] is True
+        assert result["choice"] == "deny"
+
+    @pytest.mark.asyncio
+    async def test_exact_approval_resolution_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -515,11 +781,13 @@ class TestRunEvents:
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
 
                 victim_entry = approval_mod._ApprovalEntry({
+                    "approval_id": "approval_" + "V" * 32,
                     "command": "bash -c victim-danger",
                     "description": "victim approval",
                     "pattern_keys": ["shell-c"],
                 })
                 attacker_entry = approval_mod._ApprovalEntry({
+                    "approval_id": "approval_" + "A" * 32,
                     "command": "bash -c attacker-danger",
                     "description": "attacker approval",
                     "pattern_keys": ["shell-c"],
@@ -527,17 +795,19 @@ class TestRunEvents:
                 with approval_mod._lock:
                     approval_mod._gateway_queues[victim_run] = [victim_entry]
                     approval_mod._gateway_queues[attacker_run] = [attacker_entry]
+                auth_adapter._run_approval_ids[victim_run] = {victim_entry.data["approval_id"]}
+                auth_adapter._run_approval_ids[attacker_run] = {attacker_entry.data["approval_id"]}
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={"approvalId": "approval_" + "A" * 32, "choice": "session"},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
                 assert approval_data["resolved"] == 1
-                assert attacker_entry.result == "always"
+                assert attacker_entry.result == "session"
                 assert attacker_entry.event.is_set()
                 assert victim_entry.result is None
                 assert not victim_entry.event.is_set()
@@ -745,9 +1015,7 @@ class TestRunPublicToolLifecycle:
                         break
                     await asyncio.sleep(0.02)
 
-        queued = []
-        while not adapter._run_streams[run_id].empty():
-            queued.append(adapter._run_streams[run_id].get_nowait())
+        queued = adapter._run_streams[run_id].events_after(0)
         commentary = [event for event in queued if isinstance(event, dict) and event["event"] == "assistant.commentary"]
         assert [event["text"] for event in commentary] == [
             "I will inspect [redacted-url]",
@@ -1057,8 +1325,8 @@ class TestRunLifecycleSweep:
         assert run_id in adapter._run_streams_created
 
     @pytest.mark.asyncio
-    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
-        """Stream TTL bounds buffering without detaching a live run."""
+    async def test_expired_live_run_keeps_bounded_transport_for_reconnect(self, adapter):
+        """An active run keeps its bounded replay log after a client disconnect."""
         app = _create_runs_app(adapter)
         adapter._max_concurrent_runs = 1
 
@@ -1077,12 +1345,14 @@ class TestRunLifecycleSweep:
                 assert not task.done()
 
                 pending = approval_mod._ApprovalEntry({
+                    "approval_id": "approval_" + "A" * 32,
                     "command": "bash -c long-running",
                     "description": "approval after stream TTL",
                     "pattern_keys": ["shell-c"],
                 })
                 with approval_mod._lock:
                     approval_mod._gateway_queues[run_id] = [pending]
+                adapter._run_approval_ids[run_id] = {pending.data["approval_id"]}
 
                 adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
                 # Exercise one real sweeper iteration without waiting 60 seconds.
@@ -1095,8 +1365,8 @@ class TestRunLifecycleSweep:
 
                 assert adapter._active_run_tasks[run_id] is task
                 assert adapter._active_run_agents[run_id] is mock_agent
-                assert run_id not in adapter._run_streams
-                assert run_id not in adapter._run_streams_created
+                assert run_id in adapter._run_streams
+                assert run_id in adapter._run_streams_created
                 assert adapter._run_approval_sessions[run_id] == run_id
 
                 limited = adapter._concurrency_limited_response()
@@ -1105,7 +1375,7 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"approvalId": pending.data['approval_id'], "choice": "once"},
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()
@@ -1116,8 +1386,8 @@ class TestRunLifecycleSweep:
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
 
     @pytest.mark.asyncio
-    async def test_expired_transport_stops_buffering_new_deltas(self, adapter):
-        """An unconsumed expired queue must not grow for the rest of a live run."""
+    async def test_expired_live_transport_retains_new_deltas_within_bound(self, adapter):
+        """Active runs continue recording a bounded replay log after their original TTL."""
         app = _create_runs_app(adapter)
 
         async with TestClient(TestServer(app)) as cli:
@@ -1133,15 +1403,73 @@ class TestRunLifecycleSweep:
 
                 adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
                 adapter._sweep_orphaned_runs_once(time.time())
-                before = expired_queue.qsize()
+                before = len(expired_queue.events_after(0))
                 stream_delta("must-not-buffer")
+                await asyncio.sleep(0)
+                assert len(expired_queue.events_after(0)) == before + 1
                 mock_agent.interrupt("finish test")
                 for _ in range(40):
                     if run_id not in adapter._active_run_tasks:
                         break
                     await asyncio.sleep(0.05)
 
-                assert expired_queue.qsize() == before
+                assert len(expired_queue.events_after(0)) <= adapter._RUN_EVENT_RETENTION
+
+    @pytest.mark.asyncio
+    async def test_long_running_stream_retains_replay_for_ttl_after_terminal_close(self, adapter):
+        """A long run gets a full replay TTL from terminal emitter close."""
+        app = _create_runs_app(adapter)
+        run_id = "run_long_then_terminal"
+        stream = _RunEventBuffer(asyncio.get_running_loop(), max_events=8)
+        active_task = MagicMock()
+        active_task.done.return_value = False
+        adapter._run_streams[run_id] = stream
+        adapter._run_streams_created[run_id] = time.time() - adapter._RUN_STREAM_TTL - 1
+        adapter._active_run_tasks[run_id] = active_task
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+
+        adapter._emit_run_event(run_id, {"event": "run.started", "run_id": run_id})
+        adapter._sweep_orphaned_runs_once(time.time())
+        assert run_id in adapter._run_streams
+
+        adapter._emit_run_event(run_id, {"event": "run.completed", "run_id": run_id})
+        adapter._run_statuses[run_id]["status"] = "completed"
+        adapter._close_run_event_emitter(run_id)
+        terminal_closed_at = adapter._run_streams_created[run_id]
+        active_task.done.return_value = True
+        await asyncio.sleep(0)
+
+        adapter._sweep_orphaned_runs_once(terminal_closed_at + adapter._RUN_STREAM_TTL - 1)
+        assert run_id in adapter._run_streams
+        async with TestClient(TestServer(app)) as cli:
+            replay = await cli.get(f"/v1/runs/{run_id}/events")
+            body = await replay.text()
+        assert body.index("run.started") < body.index("run.completed")
+        assert ": stream closed" in body
+
+        adapter._sweep_orphaned_runs_once(terminal_closed_at + adapter._RUN_STREAM_TTL + 1)
+        assert run_id not in adapter._run_streams
+        assert run_id not in adapter._run_streams_created
+
+    @pytest.mark.asyncio
+    async def test_terminal_stream_hard_expires_despite_stalled_subscriber(self, adapter):
+        """A non-reading SSE token cannot pin a completed replay buffer forever."""
+        run_id = "run_terminal_stalled_reader"
+        stream = _RunEventBuffer(asyncio.get_running_loop(), max_events=8)
+        adapter._run_streams[run_id] = stream
+        adapter._run_streams_created[run_id] = time.time() - adapter._RUN_STREAM_TTL - 1
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "completed"}
+        stalled_subscriber = (run_id, object())
+        adapter._run_stream_subscribers.add(stalled_subscriber)
+        adapter._emit_run_event(run_id, {"event": "message.delta", "run_id": run_id, "delta": "answer"})
+        adapter._close_run_event_emitter(run_id)
+        await asyncio.sleep(0)
+
+        adapter._sweep_orphaned_runs_once(time.time() + adapter._RUN_STREAM_TTL + 1)
+
+        assert run_id not in adapter._run_streams
+        assert run_id not in adapter._run_streams_created
+        assert stalled_subscriber not in adapter._run_stream_subscribers
 
     @pytest.mark.asyncio
     async def test_expired_orphan_run_state_is_reaped(self, adapter):
