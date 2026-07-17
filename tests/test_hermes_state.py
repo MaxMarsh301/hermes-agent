@@ -3,10 +3,25 @@
 import sqlite3
 import time
 import json
+from unittest import mock
+
 import pytest
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+
+
+def _wait_fts_rebuild(db, timeout=30):
+    """Block until the deferred FTS backfill + trash teardown complete."""
+    deadline = time.time() + timeout
+    while db.fts_rebuild_status() is not None and time.time() < deadline:
+        # The background worker may not have started (e.g. FTS disabled at
+        # open); drive a chunk inline so tests never depend on thread timing.
+        db.fts_rebuild_step()
+        time.sleep(0.01)
+    assert db.fts_rebuild_status() is None, "deferred FTS rebuild never finished"
+    while db._fts_teardown_trash_step() and time.time() < deadline:
+        time.sleep(0.01)
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -821,6 +836,9 @@ class TestSessionLifecycle:
             assert migrated_db._trigram_available is False
             assert migrated_db._fts_table_exists("messages_fts") is True
             assert migrated_db._fts_table_exists("messages_fts_trigram") is False
+
+            # Deferred v23 backfill must complete before index assertions.
+            _wait_fts_rebuild(migrated_db)
 
             # Existing messages must be searchable via base FTS.
             results = migrated_db.search_messages("legacy message")
@@ -3690,11 +3708,18 @@ class TestSchemaInit:
             assert trigram_content_only_inserts == []
             version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
             assert version == SCHEMA_VERSION
-            # Standard FTS indexes every row, including tool output.
-            normal_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+            _wait_fts_rebuild(migrated_db)
+            # Standard FTS indexes every row, including tool output (MATCH
+            # probes the index; COUNT(*) on external-content tables doesn't).
+            normal_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'snapshot'"
+            ).fetchone()[0]
             assert normal_count == 2
             # Trigram excludes role='tool' rows (v23) but keeps non-tool rows.
-            trigram_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0]
+            trigram_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'snapshot'"
+            ).fetchone()[0]
             assert trigram_count == 1
             # Tool metadata stays searchable via the standard index (#16751).
             tool_hit = migrated_db._conn.execute(
@@ -5107,10 +5132,11 @@ class TestFTS5ToolCallMigration:
         # Now open via SessionDB — migration runs.
         session_db = SessionDB(db_path=db_path)
         try:
+            _wait_fts_rebuild(session_db)
             assert len(session_db.search_messages("LEGACYTOOL")) == 1, \
-                "v11 migration must backfill tool_name into FTS"
+                "v23 migration must backfill tool_name into FTS"
             assert len(session_db.search_messages("LEGACYARG")) == 1, \
-                "v11 migration must backfill tool_calls JSON into FTS"
+                "v23 migration must backfill tool_calls JSON into FTS"
             # schema_version bumped
             from hermes_state import SCHEMA_VERSION
             row = session_db._conn.execute(
@@ -5199,18 +5225,114 @@ class TestFTSExternalContentMigration:
                 ).fetchone()
                 assert row is None, f"{shadow} must not exist in external-content mode"
 
-            # Standard FTS: all rows, tool metadata searchable (#16751).
-            assert db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 3
+            # The migration DEFERS the backfill: markers must be set and the
+            # background worker (started by __init__) drives it to completion.
+            deadline = time.time() + 30
+            while db.fts_rebuild_status() is not None and time.time() < deadline:
+                time.sleep(0.05)
+            assert db.fts_rebuild_status() is None, "deferred rebuild never finished"
+            # Trash teardown (phase 2) also completes: old renamed tables gone.
+            while db._fts_teardown_trash_step() and time.time() < deadline:
+                time.sleep(0.01)
+            trash_left = db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_v22_trash%'"
+            ).fetchall()
+            assert trash_left == [], f"trash tables not torn down: {trash_left}"
+
+            # Standard FTS: all rows searchable, tool metadata included (#16751).
             assert len(db.search_messages("TOOLBLOB")) == 1
             assert len(db.search_messages("send_message")) == 1
 
             # Trigram: tool rows excluded, CJK search over conversation works.
-            assert db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0] == 2
+            # (Index-state probes must use MATCH — COUNT(*) on an external-
+            # content FTS table delegates to the content source/view.)
             cjk = db.search_messages("大别山项目")
             assert len(cjk) == 2
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH '\"项目文件内容\"'"
+            ).fetchone()[0] == 0
             # CJK substring that exists ONLY in tool output: not in trigram,
             # but role_filter=['tool'] routes to the LIKE fallback and finds it.
             assert db.search_messages("项目文件内容", role_filter=["tool"]) != []
+        finally:
+            db.close()
+
+    def test_v23_deferred_rebuild_searchable_during_and_resumable(self, tmp_path):
+        """Mid-rebuild: new writes are indexed live, unindexed old rows are
+        still found via the gap supplement, and a killed rebuild resumes
+        from its progress marker on reopen."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        # Open WITHOUT letting the worker finish: patch the step to a no-op
+        # so the pending state holds still while we probe it.
+        with mock.patch.object(SessionDB, "start_deferred_fts_rebuild",
+                               return_value=False):
+            db = SessionDB(db_path=db_path)
+            try:
+                status = db.fts_rebuild_status()
+                assert status is not None and status["pending"]
+                assert status["indexed"] == 0 and status["total"] >= 3
+
+                # Old (unindexed) rows: FTS misses them, the gap supplement
+                # serves them.
+                hits = db.search_messages("TOOLBLOB")
+                assert len(hits) == 1, "gap supplement must find unindexed rows"
+                # Direct index probe (MATCH uses the index; COUNT(*) on an
+                # external-content table delegates to the content source and
+                # can't see index state): old row absent from the index.
+                assert db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'TOOLBLOB'"
+                ).fetchone()[0] == 0
+
+                # New writes while pending are indexed live (id > high_water).
+                db.create_session(session_id="s2", source="cli")
+                db.append_message("s2", role="user", content="LIVEWRITE token")
+                assert db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'LIVEWRITE'"
+                ).fetchone()[0] == 1
+                assert len(db.search_messages("LIVEWRITE")) == 1
+
+                # Run exactly one chunk manually — progress advances.
+                db.fts_rebuild_step()
+                status2 = db.fts_rebuild_status()
+                assert status2 is None or status2["indexed"] > 0
+            finally:
+                db.close()
+
+        # Reopen normally: the worker resumes from the marker and finishes.
+        db = SessionDB(db_path=db_path)
+        try:
+            deadline = time.time() + 30
+            while db.fts_rebuild_status() is not None and time.time() < deadline:
+                time.sleep(0.05)
+            assert db.fts_rebuild_status() is None
+            # Everything searchable via FTS now; no duplicate index entries.
+            assert len(db.search_messages("TOOLBLOB")) == 1
+            assert len(db.search_messages("LIVEWRITE")) == 1
+            for term in ("TOOLBLOB", "LIVEWRITE"):
+                n = db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                    (term,),
+                ).fetchone()[0]
+                assert n == 1, f"{term} must be indexed exactly once (got {n})"
+            # integrity-check would raise on index/content disagreement
+            # (including double-indexed rowids).
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_v23_fresh_db_has_no_pending_rebuild(self, tmp_path):
+        """A brand-new DB never enters the deferred-rebuild state."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            assert db.fts_rebuild_status() is None
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="hello fresh world")
+            assert len(db.search_messages("fresh")) == 1
         finally:
             db.close()
 
