@@ -98,6 +98,32 @@ def test_config_uses_gateway_authoritative_env_names_and_fails_closed(monkeypatc
         config_module.AntonConfig.from_env()
 
 
+def test_v2_origin_context_is_exact_and_binds_only_server_generated_parent_run():
+    plugin = load_plugin()
+    import importlib
+    origin = importlib.import_module(plugin.__name__ + ".origin_context")
+    context = {
+        "origin": "anton",
+        "originConversationId": "conversation_0123456789abcdef0123456789abcdef",
+        "hermesSessionId": "anton-chat-0123456789abcdef0123456789abcdef",
+        "protocol": "anton.delegation.v1",
+        "mode": "parent_continuation",
+    }
+    trusted = origin.parse_v2_origin(context)
+    assert trusted.parent_run_id is None
+    bound = origin.bind_parent_run(trusted, "run_0123456789abcdef0123456789abcdef")
+    assert bound.parent_run_id == "run_0123456789abcdef0123456789abcdef"
+    assert trusted.parent_run_id is None
+    for invalid in (
+        {**context, "parentRunId": "run_0123456789abcdef0123456789abcdef"},
+        {key: value for key, value in context.items() if key != "mode"},
+        {**context, "mode": "other"},
+        {**context, "hermesSessionId": "session_0123456789abcdef0123456789abcdef"},
+    ):
+        with pytest.raises(ValueError):
+            origin.parse_v2_origin(invalid)
+
+
 @pytest.mark.asyncio
 async def test_adapter_is_instantiable_and_returns_minimal_chat_info(monkeypatch):
     """Plugin registration must precede construction of its dynamic Platform."""

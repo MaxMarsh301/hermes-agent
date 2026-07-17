@@ -478,6 +478,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        restricted_execution: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -554,6 +555,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            restricted_execution=restricted_execution,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
@@ -1721,6 +1723,11 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        # This is the outermost guard: restricted continuation turns may carry
+        # private request-local context and must not mutate state or filesystem.
+        if getattr(self, "restricted_execution", False) or getattr(self, "_persist_disabled", False):
+            return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -3558,6 +3565,27 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
+        # Private syntheses must not trigger process, VM/browser, child, or
+        # session teardown. They own only in-memory state and their own client.
+        if getattr(self, "restricted_execution", False):
+            try:
+                with self._active_children_lock:
+                    self._active_children.clear()
+            except Exception:
+                pass
+            try:
+                self._session_messages = []
+            except Exception:
+                pass
+            try:
+                client = getattr(self, "client", None)
+                if client is not None:
+                    self._close_openai_client(client, reason="agent_close", shared=True)
+                    self.client = None
+            except Exception:
+                pass
+            return
+
         task_id = getattr(self, "session_id", None) or ""
 
         # 1. Kill background processes for this task

@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import sys
 import types
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -148,6 +149,30 @@ def test_tick_calls_registered_bounded_retry_hook(monkeypatch, tmp_path):
     monkeypatch.setattr(platform_registry, "get", lambda name: SimpleNamespace(cron_retry_due_fn=lambda limit: called.append((name, limit))))
     assert scheduler.tick(verbose=False) == 0
     assert called == [("anton", 10)]
+
+
+@pytest.mark.asyncio
+async def test_sync_cron_hook_does_not_create_delegation_coroutine_in_async_context(monkeypatch):
+    plugin = load_plugin()
+    outbox_module = importlib.import_module(plugin.__name__ + ".outbox")
+    platform = importlib.import_module(plugin.__name__ + ".platform")
+
+    class EmptyCronOutbox:
+        def due(self, *, limit):
+            return []
+
+    called = []
+    async def delegation_drain(*, limit):
+        called.append(limit)
+
+    monkeypatch.setattr(outbox_module, "AntonOutbox", EmptyCronOutbox)
+    monkeypatch.setattr(platform, "detached_completion_sink_ready", lambda: True)
+    monkeypatch.setattr(platform, "retry_delegation_due", delegation_drain)
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        assert platform.retry_due(limit=2) == 0
+    assert called == []
+    assert not [warning for warning in captured if "never awaited" in str(warning.message)]
 
 
 def test_all_excludes_anton(monkeypatch):

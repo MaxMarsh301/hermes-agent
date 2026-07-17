@@ -296,3 +296,27 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_restricted_finalizer_skips_kanban_persistence_memory_and_plugin_hooks(monkeypatch):
+    agent = _LimitAgent()
+    agent.restricted_execution = True
+    agent._save_trajectory = MagicMock()
+    agent._cleanup_task_resources = MagicMock()
+    agent._persist_session = MagicMock()
+    agent._sync_external_memory_for_turn = MagicMock()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "restricted-task")
+    hooks = MagicMock(return_value=[])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hooks)
+    record_failure = MagicMock()
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record_failure)
+
+    result = _finalize(agent, final_response=None, exit_reason="unknown")
+
+    assert result["final_response"] == "summary from extra call"
+    hooks.assert_not_called()
+    record_failure.assert_not_called()
+    agent._save_trajectory.assert_not_called()
+    agent._cleanup_task_resources.assert_not_called()
+    agent._persist_session.assert_not_called()
+    agent._sync_external_memory_for_turn.assert_not_called()

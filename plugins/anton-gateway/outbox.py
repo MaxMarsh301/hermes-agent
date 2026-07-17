@@ -4,10 +4,164 @@ import json
 import os
 import tempfile
 import uuid
+import hashlib
+import sqlite3
+import time
+from typing import Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+
+
+class DelegationOutboxIntegrityError(RuntimeError):
+    """A delivery ID was reused with a materially different immutable record."""
+
+
+class DelegationOutbox:
+    """SQLite-backed, fenced outbox for detached delegation completions.
+
+    This intentionally does not share the cron JSON outbox: its records are
+    protocol bytes, not cron messages, and its lease state must survive process
+    races independently of scheduler delivery.
+    """
+
+    MIN_LEASE_SECONDS = 180.0
+    MAX_ATTEMPTS = 20
+    MAX_CLAIM_LIMIT = 50
+
+    def __init__(self, path: Path | None = None, *, clock=None, random_fn=None):
+        self.path = path or get_hermes_home() / "state.db"
+        self.clock = clock or time.time
+        self.random = random_fn or __import__("random").random
+        self._migrate()
+
+    def _connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout=10000")
+        return conn
+
+    def _migrate(self):
+        with self._connect() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS anton_delegation_outbox (
+                delivery_id TEXT PRIMARY KEY,
+                route_json TEXT NOT NULL,
+                body BLOB NOT NULL,
+                body_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending','claimed','delivered','dead_letter')),
+                lease_token TEXT, lease_version INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at REAL, attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL, error_code TEXT, error_status INTEGER,
+                ack_json TEXT, outcome TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                delivered_at REAL
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_anton_delegation_outbox_due ON anton_delegation_outbox(state, next_attempt_at) WHERE state='pending'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_anton_delegation_outbox_lease ON anton_delegation_outbox(state, lease_expires_at) WHERE state='claimed'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_anton_delegation_outbox_retention ON anton_delegation_outbox(state, delivered_at) WHERE state IN ('delivered','dead_letter')")
+
+    @staticmethod
+    def _route(route: Any) -> str:
+        return json.dumps(route, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _row(row):
+        if row is None:
+            return None
+        keys = ("deliveryId","routeJson","body","bodySha256","state","leaseToken","leaseVersion","leaseExpiresAt","attempts","nextAttemptAt","errorCode","errorStatus","ackJson","outcome","createdAt","updatedAt","deliveredAt")
+        return dict(zip(keys, row))
+
+    def create_or_confirm(self, delivery_id: str, route: Any, body: bytes | str, body_sha256: str) -> dict:
+        if isinstance(body, str): body = body.encode("utf-8")
+        if not isinstance(body, bytes) or len(body) > 65536 or hashlib.sha256(body).hexdigest() != body_sha256:
+            raise DelegationOutboxIntegrityError("invalid immutable delegation record")
+        route_json, now = self._route(route), float(self.clock())
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT route_json, body, body_sha256 FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO anton_delegation_outbox (delivery_id,route_json,body,body_sha256,state,next_attempt_at,created_at,updated_at) VALUES (?,?,?,?, 'pending',?,?,?)", (delivery_id, route_json, body, body_sha256, now, now, now))
+            elif row != (route_json, body, body_sha256):
+                conn.rollback()
+                raise DelegationOutboxIntegrityError("immutable delegation delivery conflict")
+            saved = conn.execute("SELECT delivery_id,route_json,body,body_sha256,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            return self._row(saved)
+
+    def due(self, limit: int = 10, lease_seconds: float = MIN_LEASE_SECONDS) -> list[dict]:
+        try: limit = min(max(0, int(limit)), self.MAX_CLAIM_LIMIT)
+        except (TypeError, ValueError): return []
+        if not limit: return []
+        now, lease_seconds = float(self.clock()), max(float(lease_seconds), self.MIN_LEASE_SECONDS)
+        result = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Consume exhausted due work before selecting ownership.  This fences
+            # a crashed twentieth sender: once its lease expires it cannot cause
+            # a twenty-first HTTP attempt.
+            conn.execute(
+                "UPDATE anton_delegation_outbox SET state='dead_letter', lease_token=NULL, "
+                "lease_expires_at=NULL, error_code='attempts_exhausted', updated_at=? "
+                "WHERE attempts>=? AND ((state='pending' AND next_attempt_at<=?) "
+                "OR (state='claimed' AND lease_expires_at<=?))",
+                (now, self.MAX_ATTEMPTS, now, now),
+            )
+            rows = conn.execute(
+                "SELECT delivery_id FROM anton_delegation_outbox WHERE attempts<? AND "
+                "((state='pending' AND next_attempt_at<=?) OR (state='claimed' AND lease_expires_at<=?)) "
+                "ORDER BY next_attempt_at, created_at LIMIT ?",
+                (self.MAX_ATTEMPTS, now, now, limit),
+            ).fetchall()
+            for (delivery_id,) in rows:
+                token = uuid.uuid4().hex
+                conn.execute("UPDATE anton_delegation_outbox SET state='claimed', lease_token=?, lease_version=lease_version+1, lease_expires_at=?, attempts=attempts+1, updated_at=? WHERE delivery_id=? AND attempts<? AND (state='pending' OR (state='claimed' AND lease_expires_at<=?))", (token, now + lease_seconds, now, delivery_id, self.MAX_ATTEMPTS, now))
+                row = conn.execute("SELECT delivery_id,route_json,body,body_sha256,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+                result.append(self._row(row))
+        return result
+
+    def _settle(self, delivery_id, token, version, *, state, error_code=None, error_status=None, ack=None, outcome=None, next_attempt_at=None):
+        now = float(self.clock())
+        with self._connect() as conn:
+            cur = conn.execute("UPDATE anton_delegation_outbox SET state=?, lease_token=NULL, lease_expires_at=NULL, error_code=?, error_status=?, ack_json=?, outcome=?, next_attempt_at=COALESCE(?,next_attempt_at), updated_at=?, delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END WHERE delivery_id=? AND state='claimed' AND lease_token=? AND lease_version=?", (state, error_code, error_status, json.dumps(ack, sort_keys=True, separators=(",", ":")) if ack else None, outcome, next_attempt_at, now, state, now, delivery_id, token, version))
+            return cur.rowcount == 1
+
+    def delivered(self, delivery_id, token, version, ack, outcome):
+        return self._settle(delivery_id, token, version, state="delivered", ack=ack, outcome=outcome)
+
+    def dead_letter(self, delivery_id, token, version, code, status=None):
+        return self._settle(delivery_id, token, version, state="dead_letter", error_code=code, error_status=status)
+
+    def retry(self, delivery_id, token, version, code, status=None, retry_after=None):
+        # attempts was consumed at claim time, exactly once per HTTP ownership.
+        row = self.get(delivery_id)
+        if row is None or row["attempts"] >= self.MAX_ATTEMPTS:
+            return self.dead_letter(delivery_id, token, version, code, status)
+        cap = min(900.0, 5.0 * (2 ** max(0, row["attempts"] - 1)))
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after >= 0:
+            delay = min(900.0, float(retry_after))
+        else:
+            # Full bounded jitter with a nonzero five-second floor.  Attempt one
+            # has cap=floor and is therefore exactly five seconds.
+            jitter = min(1.0, max(0.0, float(self.random())))
+            delay = 5.0 + jitter * (cap - 5.0)
+        return self._settle(delivery_id, token, version, state="pending", error_code=code, error_status=status, next_attempt_at=float(self.clock()) + delay)
+
+    def get(self, delivery_id: str):
+        with self._connect() as conn:
+            return self._row(conn.execute("SELECT delivery_id,route_json,body,body_sha256,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone())
+
+    def ingest_handoffs(self, limit: int = 10) -> int:
+        """Materialize Slice B handoffs before acknowledging their ledger claim."""
+        from tools.async_delegation import claim_anton_handoffs, release_anton_handoff, mark_anton_handoff_completed
+        created = 0
+        for handoff in claim_anton_handoffs(limit=limit, lease_seconds=self.MIN_LEASE_SECONDS):
+            try:
+                self.create_or_confirm(handoff["delivery_id"], handoff["route"], handoff["body_json"], handoff["body_sha256"])
+                if not mark_anton_handoff_completed(handoff["delegation_id"], handoff["claim_token"], handoff["claim_version"]):
+                    raise RuntimeError("ledger acknowledgement lost")
+                created += 1
+            except Exception:
+                release_anton_handoff(handoff["delegation_id"], handoff["claim_token"], handoff["claim_version"])
+        return created
 
 
 class AntonOutbox:

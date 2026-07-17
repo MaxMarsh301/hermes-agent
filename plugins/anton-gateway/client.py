@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import secrets
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -14,12 +16,16 @@ from .config import AntonConfig, validate_base_url
 MAX_RESOLVER_REQUEST_BYTES = 16 * 1024
 MAX_DELIVERY_REQUEST_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1_048_576
+MAX_DELEGATION_REQUEST_BYTES = 65_536
+MAX_DELEGATION_ACK_BYTES = 2_048
+DELEGATION_VERSION = "hermes-delegation-completion-v1"
+DELEGATION_PATH = "/internal/anton-delegation-deliveries/v1"
 
 
 class AntonTransportError(RuntimeError):
-    def __init__(self, code: str, retryable: bool = False):
+    def __init__(self, code: str, retryable: bool = False, retry_after: float | None = None):
         super().__init__(code)
-        self.code, self.retryable = code, retryable
+        self.code, self.retryable, self.retry_after = code, retryable, retry_after
 
 
 def canonical_json(value: object) -> bytes:
@@ -27,11 +33,23 @@ def canonical_json(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def canonical_completion_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 def iso_timestamp(now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("ANTON timestamps must be timezone-aware")
     return now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def delegation_timestamp(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("ANTON timestamps must be timezone-aware")
+    utc = now.astimezone(timezone.utc)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond // 1000:03d}Z"
 
 
 def _request_limit(purpose: str) -> int:
@@ -44,6 +62,23 @@ def _request_limit(purpose: str) -> int:
 
 def _retryable_status(status: int) -> bool:
     return status in {408, 429} or 500 <= status <= 599
+
+
+def parse_retry_after(value: str | None, now: datetime) -> float | None:
+    """Parse Retry-After delta-seconds or an IMF-fixdate against sender time."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdecimal():
+        return float(value)
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None or now.tzinfo is None:
+        return None
+    seconds = (retry_at.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()
+    return seconds if seconds >= 0 else None
 
 
 class AntonGatewayClient:
@@ -75,6 +110,57 @@ class AntonGatewayClient:
         if purpose == "resolver":
             headers["X-AG-Resolver-Scope"] = "anton.resolve"
         return headers
+
+    def _delegation_headers(self, body: bytes) -> dict[str, str]:
+        if not self.config.delegation_delivery_key or not self.config.delegation_delivery_key_id:
+            raise AntonTransportError("disabled")
+        timestamp = delegation_timestamp(self._clock())
+        nonce = secrets.token_urlsafe(32).rstrip("=")
+        digest = hashlib.sha256(body).hexdigest()
+        preimage = f"{DELEGATION_VERSION}\nPOST\n{DELEGATION_PATH}\n{timestamp}\n{nonce}\n{self.config.delegation_delivery_key_id}\n{digest}\n".encode("utf-8")
+        signature = hmac.new(self.config.delegation_delivery_key.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+        return {"Content-Type": "application/json; charset=utf-8", "X-Anton-Delegation-Version": DELEGATION_VERSION,
+                "X-Anton-Delegation-Key-Id": self.config.delegation_delivery_key_id,
+                "X-Anton-Delegation-Timestamp": timestamp, "X-Anton-Delegation-Nonce": nonce,
+                "X-Anton-Delegation-Body-SHA256": digest, "X-Anton-Delegation-Signature": signature}
+
+    async def deliver_delegation(self, body: bytes, delivery_id: str) -> dict[str, Any]:
+        """Send stored completion bytes; this is deliberately separate from cron delivery."""
+        if not self.config.enabled or not isinstance(body, bytes) or len(body) > MAX_DELEGATION_REQUEST_BYTES:
+            raise AntonTransportError("disabled" if not self.config.enabled else "request_too_large")
+        timeout = httpx.Timeout(self.config.timeout, connect=self.config.timeout, read=self.config.timeout, write=self.config.timeout, pool=self.config.timeout)
+        try:
+            async with asyncio.timeout(self.config.timeout):
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=self._transport) as client:
+                    async with client.stream("POST", self._base_url + DELEGATION_PATH, headers=self._delegation_headers(body), content=body) as response:
+                        status, chunks, size = response.status_code, [], 0
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > MAX_DELEGATION_ACK_BYTES: raise AntonTransportError("ack_too_large", True)
+                            chunks.append(chunk)
+        except AntonTransportError: raise
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.RequestError): raise AntonTransportError("network", True) from None
+        if status in {400, 401, 409, 413, 415} or 300 <= status < 400:
+            raise AntonTransportError(f"http_{status}", False)
+        if status == 429:
+            try:
+                retry_after = parse_retry_after(response.headers.get("Retry-After"), self._clock())
+            except (TypeError, ValueError):
+                retry_after = None
+            raise AntonTransportError("http_429", True, retry_after)
+        if status == 404 or status >= 500 or status < 200 or status >= 300:
+            raise AntonTransportError(f"http_{status}", True)
+        try: ack = json.loads(b"".join(chunks))
+        except (ValueError, UnicodeDecodeError): raise AntonTransportError("invalid_ack", True) from None
+        expected_keys = {"version", "deliveryId", "accepted", "deduplicated", "outcome"}
+        if (not isinstance(ack, dict) or set(ack) != expected_keys or ack.get("version") != DELEGATION_VERSION
+                or ack.get("deliveryId") != delivery_id or ack.get("accepted") is not True
+                or ack.get("outcome") not in {"queued", "target_gone"}):
+            raise AntonTransportError("invalid_ack", True)
+        expected_dedup = status == 200
+        if status not in {200, 202} or ack.get("deduplicated") is not expected_dedup:
+            raise AntonTransportError("invalid_ack", True)
+        return ack
 
     async def _post(self, purpose: str, path: str, body: bytes) -> dict[str, Any]:
         if not self.config.enabled:

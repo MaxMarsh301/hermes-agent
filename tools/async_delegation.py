@@ -38,10 +38,13 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
+import re
 import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
@@ -78,6 +81,19 @@ _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
+_CONVERSATION_RE = re.compile(r"conversation_[0-9a-f]{32}\Z")
+_RUN_RE = re.compile(r"run_[0-9a-f]{32}\Z")
+_SESSION_RE = re.compile(r"anton-chat-[0-9a-f]{32}\Z")
+_TARGET_RE = re.compile(r"anton:conversation_[0-9a-f]{32}\Z")
+_DELIVERY_RE = re.compile(r"delivery_[0-9a-f]{32}\Z")
+_PRIVATE_RE = re.compile(r"\[private\].*?\[/private\]", re.I | re.S)
+_URL_RE = re.compile(r"(?:https?|ftp)://\S+|\b\S+://\S+", re.I)
+_ABSOLUTE_PATH_RE = re.compile(r"(?<!\w)/(?:[^\s/]+(?:/[^\s/]+)*)")
+_DELEGATION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\Z")
+_SECRET_RE = re.compile(r"(?i)\b(?:sk|token|secret|password|api[_-]?key)[=_:-]?[A-Za-z0-9_./+=-]{8,}\b")
+_TRACEBACK_RE = re.compile(r"(?is)traceback\s*\(most recent call last\):.*")
+_MAX_HANDOFF_CLAIM_LIMIT = 100
 
 
 def _db_path():
@@ -108,7 +124,18 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            delivery_kind TEXT NOT NULL DEFAULT 'session',
+            anton_route_json TEXT,
+            delivery_id TEXT,
+            anton_body_json TEXT,
+            anton_body_sha256 TEXT,
+            handoff_state TEXT,
+            handoff_claim_token TEXT,
+            handoff_claim_version INTEGER NOT NULL DEFAULT 0,
+            handoff_claim_expires_at REAL,
+            handoff_attempts INTEGER NOT NULL DEFAULT 0,
+            handoff_updated_at REAL
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -118,10 +145,177 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("delivery_kind", "TEXT NOT NULL DEFAULT 'session'"),
+        ("anton_route_json", "TEXT"),
+        ("delivery_id", "TEXT"),
+        ("anton_body_json", "TEXT"),
+        ("anton_body_sha256", "TEXT"),
+        ("handoff_state", "TEXT"),
+        ("handoff_claim_token", "TEXT"),
+        ("handoff_claim_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("handoff_claim_expires_at", "REAL"),
+        ("handoff_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("handoff_updated_at", "REAL"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_async_delegations_delivery_id ON async_delegations(delivery_id) WHERE delivery_id IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_async_delegations_anton_handoff_due ON async_delegations(handoff_state, handoff_claim_expires_at, completed_at) WHERE delivery_kind='anton' AND handoff_state IN ('pending','claimed')")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_async_delegations_anton_terminal ON async_delegations(completed_at) WHERE delivery_kind='anton'")
     return conn
+
+
+def _trusted_anton_route() -> Optional[Dict[str, str]]:
+    """Capture only the authenticated, request-scoped v2 route at dispatch."""
+    try:
+        from hermes_plugins.anton_gateway.origin_context import get
+        origin = get()
+    except Exception:
+        return None
+    if origin is None:
+        return None
+    value = lambda snake, camel: getattr(origin, snake, None) if not isinstance(origin, dict) else origin.get(camel, origin.get(snake))
+    protocol = value("protocol", "protocol")
+    mode = value("mode", "mode")
+    # A trusted v2-shaped origin must never silently degrade to a session route.
+    is_v2_claim = protocol == "anton.delegation.v1" or mode == "parent_continuation"
+    if not is_v2_claim:
+        return None
+    conversation = value("origin_conversation_id", "originConversationId")
+    target = value("delivery_target", "deliveryTarget")
+    parent_run = value("parent_run_id", "parentRunId")
+    parent_session = value("hermes_session_id", "parentSessionId")
+    if not (
+        protocol == "anton.delegation.v1" and mode == "parent_continuation"
+        and isinstance(conversation, str) and _CONVERSATION_RE.fullmatch(conversation)
+        and isinstance(target, str) and _TARGET_RE.fullmatch(target)
+        and target == f"anton:{conversation}"
+        and isinstance(parent_run, str) and _RUN_RE.fullmatch(parent_run)
+        and isinstance(parent_session, str) and _SESSION_RE.fullmatch(parent_session)
+    ):
+        raise ValueError("authenticated ANTON delegation origin is incomplete or invalid")
+    return {"protocol": protocol, "deliveryTarget": target, "originConversationId": conversation,
+            "parentRunId": parent_run, "parentSessionId": parent_session}
+
+
+def _canonical_json(value: Dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _safe_summary(result: Dict[str, Any]) -> str:
+    """Return a bounded forced-redacted terminal projection, never raw errors."""
+    raw = result.get("summary")
+    if not isinstance(raw, str) and isinstance(result.get("results"), list):
+        # Combined batch objects intentionally have no top-level summary. Keep
+        # child order deterministic and never substitute raw child errors.
+        raw = "; ".join(
+            child["summary"] for child in result["results"][:32]
+            if isinstance(child, dict) and isinstance(child.get("summary"), str)
+        )
+    if not isinstance(raw, str) or not raw:
+        return "Delegated work reached a terminal state."
+    try:
+        from agent.redact import redact_sensitive_text
+        text = redact_sensitive_text(raw, force=True)
+        # The generic redactor intentionally preserves URLs and paths. This
+        # private callback projection is stricter by contract.
+        text = _PRIVATE_RE.sub("[redacted]", text)
+        text = _TRACEBACK_RE.sub("[redacted]", text)
+        text = _SECRET_RE.sub("[redacted]", text)
+        text = _URL_RE.sub("[redacted]", text)
+        text = _ABSOLUTE_PATH_RE.sub("[redacted]", text)
+        text = " ".join(text.split())
+        if not text or "traceback" in text.lower():
+            raise ValueError("unsafe summary")
+    except Exception:
+        return "Delegated work reached a terminal state."
+    encoded = text.encode("utf-8")[:2048]
+    while encoded:
+        try:
+            return encoded.decode("utf-8")
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    return "Delegated work reached a terminal state."
+
+
+def _valid_rfc3339_millis(value: Any) -> bool:
+    if not isinstance(value, str) or not _TIMESTAMP_RE.fullmatch(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_anton_handoff(route_json: Any, delivery_id: Any, body: Any, digest: Any) -> bool:
+    """Validate persisted terminal material before it can be leased.
+
+    A corrupt oldest candidate fails the whole ordered claim batch closed; this
+    avoids silently reordering a mixed good/corrupt durable handoff queue.
+    """
+    if not isinstance(route_json, str) or not isinstance(delivery_id, str) or not _DELIVERY_RE.fullmatch(delivery_id):
+        return False
+    if not isinstance(body, str) or not isinstance(digest, str):
+        return False
+    encoded = body.encode("utf-8")
+    if len(encoded) > 65536 or hashlib.sha256(encoded).hexdigest() != digest:
+        return False
+    try:
+        route, parsed = json.loads(route_json), json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    required_route = {"protocol", "deliveryTarget", "originConversationId", "parentRunId", "parentSessionId"}
+    required_body = {"version", "deliveryId", "delegationId", "parentRunId", "parentSessionId", "deliveryTarget", "status", "occurredAt", "completion"}
+    required_completion = {"summary", "completedChildren", "failedChildren", "interruptedChildren", "unknownChildren"}
+    if not isinstance(route, dict) or not isinstance(parsed, dict) or set(route) != required_route or set(parsed) != required_body:
+        return False
+    completion = parsed.get("completion")
+    if not isinstance(completion, dict) or set(completion) != required_completion:
+        return False
+    counts = ("completedChildren", "failedChildren", "interruptedChildren", "unknownChildren")
+    return (
+        route["protocol"] == "anton.delegation.v1"
+        and isinstance(route["originConversationId"], str) and _CONVERSATION_RE.fullmatch(route["originConversationId"])
+        and isinstance(route["deliveryTarget"], str) and _TARGET_RE.fullmatch(route["deliveryTarget"])
+        and route["deliveryTarget"] == f"anton:{route['originConversationId']}"
+        and isinstance(route["parentRunId"], str) and _RUN_RE.fullmatch(route["parentRunId"])
+        and isinstance(route["parentSessionId"], str) and _SESSION_RE.fullmatch(route["parentSessionId"])
+        and parsed["version"] == "hermes-delegation-completion-v1"
+        and isinstance(parsed["delegationId"], str) and _DELEGATION_RE.fullmatch(parsed["delegationId"])
+        and parsed["deliveryId"] == delivery_id
+        and parsed["parentRunId"] == route["parentRunId"]
+        and parsed["parentSessionId"] == route["parentSessionId"]
+        and parsed["deliveryTarget"] == route["deliveryTarget"]
+        and _valid_rfc3339_millis(parsed["occurredAt"])
+        and parsed["status"] in {"completed", "failed", "interrupted", "unknown"}
+        and isinstance(completion["summary"], str) and len(completion["summary"].encode("utf-8")) <= 2048
+        and all(isinstance(completion[key], int) and 0 <= completion[key] <= 10000 for key in counts)
+        and 1 <= sum(completion[key] for key in counts) <= 10000
+    )
+
+
+def _anton_body(record: Dict[str, Any], result: Dict[str, Any], status: str, occurred_at: float) -> str:
+    results = result.get("results") if isinstance(result.get("results"), list) else [result]
+    counts = {"completed": 0, "failed": 0, "interrupted": 0, "unknown": 0}
+    for child in results:
+        child_status = str((child or {}).get("status") or status).lower()
+        key = "completed" if child_status in {"completed", "success"} else child_status
+        counts[key if key in counts else "failed"] += 1
+    if sum(counts.values()) < 1:
+        counts["failed"] = 1
+    route = record["anton_route"]
+    body = {
+        "version": "hermes-delegation-completion-v1", "deliveryId": record["delivery_id"],
+        "delegationId": record["delegation_id"], "parentRunId": route["parentRunId"],
+        "parentSessionId": route["parentSessionId"], "deliveryTarget": route["deliveryTarget"],
+        "status": status if status in counts else "failed",
+        "occurredAt": datetime.fromtimestamp(occurred_at, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "completion": {"summary": _safe_summary(result), "completedChildren": counts["completed"],
+                       "failedChildren": counts["failed"], "interruptedChildren": counts["interrupted"],
+                       "unknownChildren": counts["unknown"]},
+    }
+    return _canonical_json(body)
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
@@ -138,16 +332,19 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     }
     with _DB_LOCK, _connect() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
-                delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?)""",
+                delivery_state, delivery_attempts, owner_pid, owner_started_at,
+                task_json, delivery_kind, anton_route_json, delivery_id,
+                handoff_state, handoff_updated_at)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload)),
+             record["dispatched_at"], now, __import__("os").getpid(), owner_started_at,
+             json.dumps(task_payload), record.get("delivery_kind", "session"),
+             _canonical_json(record["anton_route"]) if record.get("anton_route") else None,
+             record.get("delivery_id"), None, now),
         )
     _prune_durable_records()
 
@@ -163,11 +360,13 @@ def _prune_durable_records() -> None:
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _connect() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
+            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ? AND (delivery_kind!='anton' OR handoff_state='completed')",
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing')
+                 AND (delivery_kind!='anton' OR handoff_state='completed')"""
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
@@ -175,6 +374,7 @@ def _prune_durable_records() -> None:
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
+                       AND (delivery_kind!='anton' OR handoff_state='completed')
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""",
@@ -182,7 +382,8 @@ def _prune_durable_records() -> None:
             )
         pending_count = conn.execute(
             """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
+               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                 AND delivery_kind!='anton'"""
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
@@ -190,21 +391,32 @@ def _prune_durable_records() -> None:
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       AND delivery_kind!='anton'
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (overflow,),
             )
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any], record: Optional[Dict[str, Any]] = None) -> None:
     now = time.time()
+    anton = bool(record and record.get("delivery_kind") == "anton")
+    terminal_status = event.get("status", "completed")
+    if anton and terminal_status not in {"completed", "failed", "interrupted", "unknown"}:
+        terminal_status = "failed"
+        event = dict(event)
+        event["status"] = terminal_status
+    body = _anton_body(record or {}, result, terminal_status, event.get("completed_at", now)) if anton else None
     with _DB_LOCK, _connect() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
+               event_json=?, result_json=?, delivery_state='pending', anton_body_json=?,
+               anton_body_sha256=?, handoff_state=?, handoff_updated_at=?
+ WHERE delegation_id=? AND state IN ('running','finalizing')""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+             json.dumps(event), json.dumps(result), body,
+             hashlib.sha256(body.encode("utf-8")).hexdigest() if body else None,
+             "pending" if anton else None, now if anton else None, event["delegation_id"]),
         )
 
 
@@ -228,11 +440,11 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json
+                      owner_started_at, task_json, delivery_kind, anton_route_json, delivery_id
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json = row
+            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, delivery_kind, route_json, delivery_id = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -253,12 +465,23 @@ def recover_abandoned_delegations() -> int:
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
             result = {"status": "unknown", "summary": None, "error": event["error"]}
-            conn.execute(
+            if delivery_kind == "anton":
+                route = json.loads(route_json)
+                record = {"delegation_id": delegation_id, "delivery_kind": "anton", "anton_route": route, "delivery_id": delivery_id}
+                body = _anton_body(record, result, "unknown", now)
+                conn.execute(
+                    """UPDATE async_delegations SET state='unknown', completed_at=?, updated_at=?,
+                       event_json=?, result_json=?, delivery_state='pending', anton_body_json=?, anton_body_sha256=?,
+                       handoff_state='pending', handoff_updated_at=? WHERE delegation_id=?""",
+                    (now, now, json.dumps(event), json.dumps(result), body, hashlib.sha256(body.encode("utf-8")).hexdigest(), now, delegation_id),
+                )
+            else:
+                conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""",
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
-            )
+                )
             recovered += 1
     return recovered
 
@@ -280,6 +503,7 @@ def restore_undelivered_completions(target_queue) -> int:
         rows = conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+                 AND delivery_kind!='anton'
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
         for _delegation_id, payload in rows:
@@ -290,13 +514,79 @@ def restore_undelivered_completions(target_queue) -> int:
     return len(rows)
 
 
+def claim_anton_handoffs(limit: int = 1, lease_seconds: float = 60.0) -> List[Dict[str, Any]]:
+    """Fence due, structurally valid ANTON terminal projections for handoff.
+
+    The transaction only mutates after every selected row validates. A corrupt
+    ordered candidate therefore returns ``[]`` and leaves all candidates
+    pending, rather than handing out a surprising partial batch.
+    """
+    try:
+        requested = int(limit)
+    except (TypeError, ValueError):
+        return []
+    if requested <= 0:
+        return []
+    requested = min(requested, _MAX_HANDOFF_CLAIM_LIMIT)
+    now = time.time()
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """SELECT delegation_id, anton_route_json, delivery_id, anton_body_json,
+                      anton_body_sha256, handoff_claim_version
+               FROM async_delegations WHERE delivery_kind='anton'
+                 AND state NOT IN ('running','finalizing')
+                 AND (handoff_state='pending' OR (handoff_state='claimed' AND handoff_claim_expires_at <= ?))
+               ORDER BY completed_at, delegation_id LIMIT ?""", (now, requested)
+        ).fetchall()
+        if any(not _valid_anton_handoff(route, delivery_id, body, digest) for _, route, delivery_id, body, digest, _ in rows):
+            conn.rollback()
+            return []
+        for delegation_id, route, delivery_id, body, digest, version in rows:
+            token = uuid.uuid4().hex
+            next_version = int(version or 0) + 1
+            cur = conn.execute(
+                """UPDATE async_delegations SET handoff_state='claimed', handoff_claim_token=?,
+                   handoff_claim_version=?, handoff_claim_expires_at=?, handoff_attempts=handoff_attempts+1,
+                   handoff_updated_at=? WHERE delegation_id=? AND delivery_kind='anton'
+                   AND (handoff_state='pending' OR (handoff_state='claimed' AND handoff_claim_expires_at <= ?))""",
+                (token, next_version, now + max(1.0, float(lease_seconds)), now, delegation_id, now),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return []
+            claimed.append({"delegation_id": delegation_id, "route": json.loads(route),
+                            "delivery_id": delivery_id, "body_json": body, "body_sha256": digest,
+                            "claim_token": token, "claim_version": next_version})
+    return claimed
+
+
+def release_anton_handoff(delegation_id: str, claim_token: str, claim_version: int) -> bool:
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute("""UPDATE async_delegations SET handoff_state='pending', handoff_claim_token=NULL,
+            handoff_claim_expires_at=NULL, handoff_updated_at=? WHERE delegation_id=? AND handoff_state='claimed'
+            AND handoff_claim_token=? AND handoff_claim_version=?""", (time.time(), delegation_id, claim_token, claim_version))
+        return cur.rowcount == 1
+
+
+def mark_anton_handoff_completed(delegation_id: str, claim_token: str, claim_version: int) -> bool:
+    """Acknowledge durable outbox copy, not network delivery."""
+    with _DB_LOCK, _connect() as conn:
+        now = time.time()
+        cur = conn.execute("""UPDATE async_delegations SET handoff_state='completed', handoff_claim_token=NULL,
+            handoff_claim_expires_at=NULL, handoff_updated_at=? WHERE delegation_id=? AND handoff_state='claimed'
+            AND handoff_claim_token=? AND handoff_claim_version=?""", (now, delegation_id, claim_token, claim_version))
+        return cur.rowcount == 1
+
+
 def mark_completion_delivered(delegation_id: str) -> bool:
-    """Atomically acknowledge successful injection of a durable completion."""
+    """Atomically acknowledge a generic session delivery, never an ANTON handoff."""
     now = time.time()
     with _DB_LOCK, _connect() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-               WHERE delegation_id=? AND delivery_state!='delivered'""",
+               WHERE delegation_id=? AND delivery_kind!='anton' AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
         return cur.rowcount == 1
@@ -307,11 +597,13 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     now = time.time()
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            "SELECT delivery_state, delivery_kind FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        if row[1] == "anton":
+            return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -339,7 +631,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=NULL,
                       delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_kind!='anton' AND delivery_state='pending'
                  AND delivery_claim=?""",
             (time.time(), delegation_id, claim_id),
         )
@@ -347,14 +639,14 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Acknowledge acceptance for the consumer holding this claim."""
+    """Acknowledge a generic session consumer claim, never an ANTON handoff."""
     now = time.time()
     with _DB_LOCK, _connect() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
                       delivery_claimed_at=NULL
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_kind!='anton' AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
         )
@@ -375,7 +667,9 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
-                      result_json, delivery_state, delivery_attempts
+                      result_json, delivery_state, delivery_attempts, delivery_kind,
+                      anton_route_json, delivery_id, anton_body_json, anton_body_sha256,
+                      handoff_state, handoff_claim_version, handoff_attempts
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -385,6 +679,9 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "dispatched_at": row[2], "completed_at": row[3],
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
+        "delivery_kind": row[7], "anton_route": json.loads(row[8]) if row[8] else None,
+        "delivery_id": row[9], "anton_body_json": row[10], "anton_body_sha256": row[11],
+        "handoff_state": row[12], "handoff_claim_version": row[13], "handoff_attempts": row[14],
     }
 
 
@@ -414,7 +711,8 @@ def active_count() -> int:
 
 
 def _new_delegation_id() -> str:
-    return f"deleg_{uuid.uuid4().hex[:8]}"
+    # Full entropy avoids accidental collisions across durable process restarts.
+    return f"deleg_{uuid.uuid4().hex}"
 
 
 def _prune_completed_locked() -> None:
@@ -483,6 +781,9 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    anton_route = _trusted_anton_route()
+    # Decouple durable routing from a mutable request context/dataclass.
+    anton_route = dict(anton_route) if anton_route else None
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -499,6 +800,9 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "delivery_kind": "anton" if anton_route else "session",
+        "anton_route": anton_route,
+        "delivery_id": f"delivery_{uuid.uuid4().hex}" if anton_route else None,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -530,7 +834,10 @@ def dispatch_async_delegation(
             result = runner() or {}
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
-            logger.exception("Async delegation %s crashed", delegation_id)
+            if record.get("delivery_kind") == "anton":
+                logger.error("ANTON async delegation %s crashed", delegation_id)
+            else:
+                logger.exception("Async delegation %s crashed", delegation_id)
             result = {
                 "status": "error",
                 "summary": None,
@@ -555,10 +862,13 @@ def dispatch_async_delegation(
             "error": f"Failed to schedule async delegation: {exc}",
         }
 
-    logger.info(
-        "Dispatched async delegation %s (session_key=%s): %s",
-        delegation_id, session_key or "<cli>", (goal or "")[:80],
-    )
+    if anton_route:
+        logger.info("Dispatched ANTON async delegation %s", delegation_id)
+    else:
+        logger.info(
+            "Dispatched async delegation %s (session_key=%s): %s",
+            delegation_id, session_key or "<cli>", (goal or "")[:80],
+        )
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
@@ -592,16 +902,6 @@ def _push_completion_event(
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
     silently-lost result, so we log loudly.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
-
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -631,7 +931,18 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
-    _persist_completion(evt, result)
+    _persist_completion(evt, result, record)
+    if record.get("delivery_kind") == "anton":
+        return
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Async delegation %s finished but process_registry import failed; "
+            "result lost: %s",
+            record.get("delegation_id"), exc,
+        )
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -676,6 +987,9 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    anton_route = _trusted_anton_route()
+    # Decouple durable routing from a mutable request context/dataclass.
+    anton_route = dict(anton_route) if anton_route else None
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -699,6 +1013,9 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "delivery_kind": "anton" if anton_route else "session",
+        "anton_route": anton_route,
+        "delivery_id": f"delivery_{uuid.uuid4().hex}" if anton_route else None,
     }
     with _records_lock:
         running = sum(
@@ -734,7 +1051,10 @@ def dispatch_async_delegation_batch(
             else:
                 status = "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
-            logger.exception("Async delegation batch %s crashed", delegation_id)
+            if record.get("delivery_kind") == "anton":
+                logger.error("ANTON async delegation batch %s crashed", delegation_id)
+            else:
+                logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
                 "results": [],
                 "error": f"{type(exc).__name__}: {exc}",
@@ -756,10 +1076,13 @@ def dispatch_async_delegation_batch(
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
 
-    logger.info(
-        "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
-        delegation_id, n, session_key or "<cli>",
-    )
+    if anton_route:
+        logger.info("Dispatched ANTON async delegation batch %s", delegation_id)
+    else:
+        logger.info(
+            "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
+            delegation_id, n, session_key or "<cli>",
+        )
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
@@ -775,16 +1098,6 @@ def _finalize_batch(
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
         event_record = dict(record)
-
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
-        return
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
@@ -810,7 +1123,22 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
-    _persist_completion(evt, combined)
+    _persist_completion(evt, combined, event_record)
+    if event_record.get("delivery_kind") == "anton":
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None:
+                record["status"] = status
+            _prune_completed_locked()
+        return
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Async delegation batch %s finished but process_registry import failed; result lost: %s",
+            delegation_id, exc,
+        )
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

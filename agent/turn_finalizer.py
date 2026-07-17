@@ -96,7 +96,7 @@ def finalize_turn(
         final_response = agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
 
-    if iteration_limit_fallback:
+    if iteration_limit_fallback and not getattr(agent, "restricted_execution", False):
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
@@ -169,20 +169,21 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    if not getattr(agent, "restricted_execution", False):
+        # Save trajectory if enabled.  ``user_message`` may be a multimodal
+        # list of parts; the trajectory format wants a plain string.
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
-    # Clean up VM and browser for this task after conversation completes
-    try:
-        agent._cleanup_task_resources(effective_task_id)
-    except Exception as _cleanup_err:
-        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
+        # Clean up VM and browser for this task after conversation completes.
+        try:
+            agent._cleanup_task_resources(effective_task_id)
+        except Exception as _cleanup_err:
+            _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+            logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
@@ -237,7 +238,8 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
-        agent._persist_session(messages, conversation_history)
+        if not getattr(agent, "restricted_execution", False):
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -374,7 +376,10 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (
+        final_response and not interrupted
+        and not getattr(agent, "restricted_execution", False)
+    ):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -396,7 +401,10 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if (
+        final_response and not interrupted
+        and not getattr(agent, "restricted_execution", False)
+    ):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -499,16 +507,21 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not getattr(agent, "restricted_execution", False):
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (
+        final_response and not interrupted
+        and not getattr(agent, "restricted_execution", False)
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
@@ -528,19 +541,20 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            interrupted=interrupted,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    if not getattr(agent, "restricted_execution", False):
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                interrupted=interrupted,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
 
     return result

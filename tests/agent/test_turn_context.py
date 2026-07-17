@@ -179,6 +179,22 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_restricted_turn_skips_pre_llm_plugin_and_spill_configuration():
+    agent = _FakeAgent()
+    agent.restricted_execution = True
+    with (
+        patch("hermes_cli.plugins.invoke_hook") as hook,
+        patch("tools.hook_output_spill.get_spill_config") as spill_config,
+    ):
+        ctx = _build(agent)
+
+    assert ctx.plugin_user_context == ""
+    assert agent._ensure_db_prompt_at_call == "<unset>"
+    assert agent._persist_calls == 0
+    hook.assert_not_called()
+    spill_config.assert_not_called()
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)

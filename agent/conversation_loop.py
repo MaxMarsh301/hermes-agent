@@ -78,6 +78,11 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Restricted syntheses can carry request-private context. Provider exceptions
+# are therefore untrusted and must never be interpolated into user/history/log
+# surfaces on the outer catch path.
+_RESTRICTED_EXECUTION_ERROR = "Restricted execution could not be completed safely."
+
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
@@ -362,16 +367,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not getattr(agent, "restricted_execution", False):
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -379,12 +385,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # _credits_state already exists). For the plain CLI / any path that didn't seed
     # at build, it primes credits state from /api/oauth/account (or a fixture) on the
     # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+    if not getattr(agent, "restricted_execution", False):
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -1239,7 +1246,10 @@ def run_conversation(
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    if (
+                        not getattr(agent, "restricted_execution", False)
+                        and has_hook("pre_api_request")
+                    ):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -4375,7 +4385,10 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                if (
+                    not getattr(agent, "restricted_execution", False)
+                    and has_hook("post_api_request")
+                ):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
@@ -5431,16 +5444,17 @@ def run_conversation(
                 # report") and stop with finish_reason=stop — a clean exit
                 # that the dispatcher records as protocol_violation. Nudge
                 # once or twice before allowing that exit.
-                try:
-                    from agent.kanban_stop import build_kanban_stop_nudge
+                _kanban_nudge = None
+                if not getattr(agent, "restricted_execution", False):
+                    try:
+                        from agent.kanban_stop import build_kanban_stop_nudge
 
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
-                    )
-                except Exception:
-                    logger.debug("kanban stop-loop check failed", exc_info=True)
-                    _kanban_nudge = None
+                        _kanban_nudge = build_kanban_stop_nudge(
+                            messages=messages,
+                            attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                        )
+                    except Exception:
+                        logger.debug("kanban stop-loop check failed", exc_info=True)
 
                 if _kanban_nudge:
                     agent._kanban_stop_nudges = (
@@ -5480,19 +5494,27 @@ def run_conversation(
                 break
             
         except Exception as e:
-            error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
-            try:
-                print(f"❌ {error_msg}")
-            except (OSError, ValueError):
-                logger.error(error_msg)
+            if getattr(agent, "restricted_execution", False):
+                error_msg = _RESTRICTED_EXECUTION_ERROR
+                try:
+                    print(f"❌ {error_msg}")
+                except (OSError, ValueError):
+                    pass
+                logger.error("Restricted execution provider failure")
+            else:
+                error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
+                try:
+                    print(f"❌ {error_msg}")
+                except (OSError, ValueError):
+                    logger.error(error_msg)
 
-            # Emit the full traceback at ERROR level so it lands in both
-            # agent.log AND errors.log.  Previously this was logged at DEBUG,
-            # which meant intermittent outer-loop failures were unreproducible
-            # — users would see a one-line summary on screen with no way to
-            # recover the call site.  logger.exception() includes the
-            # traceback automatically and emits at ERROR.
-            logger.exception("Outer loop error in API call #%d", api_call_count)
+                # Emit the full traceback at ERROR level so it lands in both
+                # agent.log AND errors.log.  Previously this was logged at DEBUG,
+                # which meant intermittent outer-loop failures were unreproducible
+                # — users would see a one-line summary on screen with no way to
+                # recover the call site.  logger.exception() includes the
+                # traceback automatically and emits at ERROR.
+                logger.exception("Outer loop error in API call #%d", api_call_count)
             
             # If an assistant message with tool_calls was already appended,
             # the API expects a role="tool" result for every tool_call_id.

@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import DEFAULT_AGENT_IDENTITY, build_system_prompt_parts
 
 
 def _make_agent(**overrides):
@@ -46,6 +46,22 @@ def _captured_context_cwd(agent):
 
 
 class TestContextFileCwd:
+    def test_restricted_prompt_skips_context_and_kanban_guidance(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "restricted-task")
+        agent = _make_agent(
+            restricted_execution=True,
+            valid_tool_names=["kanban_show"],
+            _kanban_worker_guidance="KANBAN_PRIVATE_GUIDANCE",
+        )
+
+        parts = build_system_prompt_parts(agent, "caller message")
+
+        assert parts == {
+            "stable": DEFAULT_AGENT_IDENTITY,
+            "context": "caller message",
+            "volatile": "",
+        }
+
     def test_none_when_terminal_cwd_unset(self, monkeypatch):
         # Unset → None, so discovery falls back to the launch dir inside
         # build_context_files_prompt (the local-CLI #19242 contract).

@@ -11,7 +11,10 @@ import io
 import json
 import logging
 import re
+import subprocess
+import sys
 import threading
+import types
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -20,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
+
 
 import run_agent
 from run_agent import AIAgent
@@ -94,6 +98,39 @@ def test_run_conversation_dict_returns_include_final_response():
         "run_conversation() dict returns must expose actionable final_response "
         f"text instead of literal None; literal None at source-local lines {literal_none}"
     )
+
+
+def test_restricted_close_only_clears_memory_and_owns_client(monkeypatch):
+    """Restricted continuations must not touch external cleanup or session state."""
+    agent = AIAgent.__new__(AIAgent)
+    agent.restricted_execution = True
+    agent.session_id = "private-session"
+    agent._session_messages = [{"role": "system", "content": "private"}]
+    agent._active_children_lock = threading.Lock()
+    child = MagicMock()
+    agent._active_children = [child]
+    agent._session_db = MagicMock()
+    client = MagicMock()
+    agent.client = client
+    own_close = MagicMock()
+    agent._close_openai_client = own_close
+    registry = MagicMock()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr(run_agent, "cleanup_vm", MagicMock())
+    monkeypatch.setattr(run_agent, "cleanup_browser", MagicMock())
+
+    agent.close()
+    agent.close()
+
+    registry.kill_all.assert_not_called()
+    run_agent.cleanup_vm.assert_not_called()
+    run_agent.cleanup_browser.assert_not_called()
+    child.close.assert_not_called()
+    agent._session_db.end_session.assert_not_called()
+    assert agent._active_children == []
+    assert agent._session_messages == []
+    own_close.assert_called_once_with(client, reason="agent_close", shared=True)
+    assert agent.client is None
 
 
 @pytest.fixture()
@@ -791,6 +828,38 @@ class TestSessionJsonSnapshotOptIn:
         # Legit IDs pass through unchanged; distinct IDs never collide.
         assert f("api-abc123def456") == "api-abc123def456"
         assert f("../a") != f("../b")
+
+
+    def test_restricted_agent_never_persists_snapshot_or_private_marker(self, monkeypatch, tmp_path):
+        """A real restricted AIAgent remains filesystem/DB isolated under hostile env."""
+        marker = "PRIVATE_SNAPSHOT_SENTINEL"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "hostile-task")
+        (tmp_path / "config.yaml").write_text(
+            "sessions:\n  write_json_snapshots: true\n", encoding="utf-8"
+        )
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            restricted = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://example.invalid/v1",
+                quiet_mode=True,
+                restricted_execution=True,
+                skip_memory=True,
+                skip_context_files=True,
+            )
+        original = [{"role": "user", "content": marker}]
+        restricted._persist_session(original, [])
+        assert restricted._session_json_enabled is False
+        assert restricted._session_db is None
+        assert restricted._session_messages == []
+        assert original == [{"role": "user", "content": marker}]
+        assert list(tmp_path.rglob("session_*.json")) == []
+        assert list(tmp_path.rglob("*.db")) == []
+        assert all(marker not in path.read_text(errors="ignore") for path in tmp_path.rglob("*") if path.is_file())
 
 
 class TestSaveSessionLogRedactsSecrets:
@@ -1774,6 +1843,49 @@ class TestEnvironmentProbeIntegration:
         agent = self._make_agent(environment_probe=False)
         prompt = agent._build_system_prompt()
         assert "Python toolchain:" not in prompt
+
+    def test_restricted_init_never_imports_or_warms_probe_and_ordinary_policy_is_preserved(self, monkeypatch, tmp_path):
+        """A real hostile-worker AIAgent must not even import the probe seam."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "hostile-kanban-task")
+        monkeypatch.delitem(sys.modules, "tools.env_probe", raising=False)
+        subprocess_calls = []
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess_calls.append((args, kwargs)))
+
+        def build(*, restricted_execution=False, environment_probe=True):
+            with (
+                patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("terminal")),
+                patch("run_agent.check_toolset_requirements", return_value={}),
+                patch("run_agent.OpenAI"),
+                patch("hermes_cli.config.load_config", return_value={"agent": {"environment_probe": environment_probe}}),
+            ):
+                agent = AIAgent(
+                    api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+                    quiet_mode=True, skip_context_files=True, skip_memory=True,
+                    restricted_execution=restricted_execution,
+                )
+                agent.client = MagicMock()
+                return agent
+
+        restricted = build(restricted_execution=True)
+        assert restricted._environment_probe is False
+        assert "tools.env_probe" not in sys.modules
+        assert "Python toolchain:" not in restricted._build_system_prompt()
+        assert subprocess_calls == []
+
+        warm_calls = []
+        fake_probe = types.ModuleType("tools.env_probe")
+        fake_probe.warm_environment_probe_async = lambda: warm_calls.append("warm")
+        monkeypatch.setitem(sys.modules, "tools.env_probe", fake_probe)
+        ordinary = build()
+        assert ordinary._environment_probe is True
+        assert warm_calls == ["warm"]
+        assert subprocess_calls == []
+
+        warm_calls.clear()
+        disabled = build(environment_probe=False)
+        assert disabled._environment_probe is False
+        assert warm_calls == []
 
 
 class TestInvalidateSystemPrompt:
