@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import secrets
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -1506,6 +1507,16 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
+# Public control-plane approval IDs are intentionally independent of pattern
+# keys, tool calls, commands, and session identifiers.  The opaque token is
+# short enough for browser transport while retaining 192 bits of entropy.
+_APPROVAL_ID_RE = re.compile(r"approval_[A-Za-z0-9_-]{32}\Z")
+
+
+def _new_approval_id() -> str:
+    """Return the public approval ID: ``approval_`` plus 32 URL-safe chars."""
+    return "approval_" + secrets.token_urlsafe(24)
+
 
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
@@ -1566,6 +1577,31 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry.reason = reason
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_id(session_key: str, approval_id: str, choice: str) -> int:
+    """Resolve exactly one pending gateway approval by its opaque public ID.
+
+    This is the control-plane counterpart to the legacy FIFO resolver.  It is
+    deliberately exact: a stale, missing, or other-run ID cannot settle the
+    oldest queue entry, and removing the entry while holding the lock makes
+    terminal responses first-terminal-wins.
+    """
+    if not isinstance(approval_id, str) or not _APPROVAL_ID_RE.fullmatch(approval_id):
+        return 0
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return 0
+        entry = next((item for item in queue if item.data.get("approval_id") == approval_id), None)
+        if entry is None:
+            return 0
+        queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+    entry.result = choice
+    entry.event.set()
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -1761,8 +1797,8 @@ def prompt_dangerous_approval(command: str, description: str,
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_description = redact_sensitive_text(description)
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
 
     if approval_callback is not None:
         try:
@@ -2537,6 +2573,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
+    # Allocate a bounded opaque ID before the notifier sees the data.  Never
+    # derive it from raw approval fields; the API uses it as the only response
+    # binding key.
+    approval_data["approval_id"] = _new_approval_id()
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
@@ -3199,9 +3239,9 @@ def check_execute_code_guard(code: str, env_type: str,
     # smart approval and executed; redaction is display-only. Approval
     # persistence keys off pattern_key, so the allowlist is unaffected.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_code = redact_sensitive_text(code)
-    display_description = redact_sensitive_text(description)
+    display_command = redact_sensitive_text(command, force=True)
+    display_code = redact_sensitive_text(code, force=True)
+    display_description = redact_sensitive_text(description, force=True)
 
     notify_cb = None
     with _lock:
