@@ -5,9 +5,11 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import hashlib
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -871,5 +873,254 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+# ---------------------------------------------------------------------------
+# Durable ANTON detached-completion handoff (Slice B)
+# ---------------------------------------------------------------------------
+
+
+def _anton_route():
+    conversation = "conversation_0123456789abcdef0123456789abcdef"
+    return {
+        "protocol": "anton.delegation.v1",
+        "originConversationId": conversation,
+        "deliveryTarget": f"anton:{conversation}",
+        "parentRunId": "run_0123456789abcdef0123456789abcdef",
+        "parentSessionId": "anton-chat-0123456789abcdef0123456789abcdef",
+    }
+
+
+def _persist_anton_terminal(tmp_path, monkeypatch, delegation_id="deleg_test"):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": delegation_id, "session_key": "private-session",
+        "origin_ui_session_id": "", "parent_session_id": "private-parent",
+        "dispatched_at": 1.0, "delivery_kind": "anton", "anton_route": _anton_route(),
+        "delivery_id": "delivery_" + hashlib.sha256(delegation_id.encode()).hexdigest()[:32],
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {"delegation_id": delegation_id, "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "safe result"}, record,
+    )
+    return record
+
+
+def test_anton_persists_before_process_registry_import_and_never_queues(tmp_path, monkeypatch):
+    record = _persist_anton_terminal(tmp_path, monkeypatch, "deleg_persist")
+    # Recreate a running row because the helper intentionally proves canonical
+    # terminal serialization separately; this path must not import registry.
+    record["delegation_id"] = "deleg_noimport"
+    record["delivery_id"] = "delivery_" + "b" * 32
+    ad._persist_dispatch(record)
+    import builtins
+    original_import = builtins.__import__
+
+    def deny_registry(name, *args, **kwargs):
+        if name == "tools.process_registry":
+            raise ImportError("registry unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", deny_registry)
+    ad._push_completion_event(record, {"status": "completed", "summary": "exact result"}, "completed")
+    durable = ad.get_durable_delegation("deleg_noimport")
+    assert durable["handoff_state"] == "pending"
+    assert durable["anton_body_sha256"] == hashlib.sha256(durable["anton_body_json"].encode()).hexdigest()
+    assert process_registry.completion_queue.empty()
+
+
+def test_anton_route_is_immutable_and_ids_are_full_entropy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    route = _anton_route()
+    monkeypatch.setattr(ad, "_trusted_anton_route", lambda: route)
+    gate = threading.Event()
+    def runner():
+        gate.wait(2)
+        return {"status": "completed", "summary": "ok"}
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="private goal", context="private context", toolsets=None, role="leaf", model="m",
+        session_key="private-session", runner=runner,
+    )
+    assert dispatched["delegation_id"].startswith("deleg_")
+    assert len(dispatched["delegation_id"].removeprefix("deleg_")) == 32
+    route["parentRunId"] = "run_" + "f" * 32
+    route["deliveryTarget"] = "anton:conversation_" + "f" * 32
+    gate.set()
+    deadline = time.monotonic() + 3
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(.01)
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    body = json.loads(durable["anton_body_json"])
+    assert durable["delivery_id"].startswith("delivery_") and len(durable["delivery_id"].removeprefix("delivery_")) == 32
+    assert body["parentRunId"] == _anton_route()["parentRunId"]
+    assert body["deliveryTarget"] == _anton_route()["deliveryTarget"]
+
+
+def test_anton_canonical_single_and_mixed_batch_callback_body_redacts(tmp_path, monkeypatch):
+    record = _persist_anton_terminal(tmp_path, monkeypatch, "deleg_body")
+    single = ad.get_durable_delegation("deleg_body")
+    body = json.loads(single["anton_body_json"])
+    assert list(body) == sorted(body)
+    assert set(body) == {"version", "deliveryId", "delegationId", "parentRunId", "parentSessionId", "deliveryTarget", "status", "occurredAt", "completion"}
+    assert body["occurredAt"] == "1970-01-01T00:00:02.000Z"
+    assert body["status"] == "completed" and body["completion"]["completedChildren"] == 1
+    single_summary = ad._safe_summary({"summary": "single token=sk_abcdefghijklmnopqrstuvwxyz https://u:p@example.test/x /private/a [private]hide[/private] Traceback (most recent call last): boom " + "界" * 1000})
+    for forbidden in ("sk_", "example.test", "/private/a", "hide", "Traceback"):
+        assert forbidden not in single_summary
+    assert len(single_summary.encode("utf-8")) <= 2048
+    sensitive = "first token=sk_abcdefghijklmnopqrstuvwxyz https://u:p@example.test/x /private/a [private]hide[/private]"
+    batch = ad._anton_body(record, {"results": [
+        {"status": "completed", "summary": sensitive},
+        {"status": "error", "summary": "second Traceback (most recent call last): boom"},
+        {"status": "interrupted", "error": "raw child error must not appear"},
+    ]}, "error", 3.0)
+    parsed = json.loads(batch)
+    assert parsed["status"] == "failed"
+    assert [parsed["completion"][key] for key in ("completedChildren", "failedChildren", "interruptedChildren", "unknownChildren")] == [1, 1, 1, 0]
+    summary = parsed["completion"]["summary"]
+    for forbidden in ("sk_", "example.test", "/private/a", "hide", "Traceback", "raw child error"):
+        assert forbidden not in summary
+    assert "first" in summary and "second" in summary
+    assert len(batch.encode("utf-8")) <= 65536 and len(summary.encode("utf-8")) <= 2048
+
+
+def test_anton_sensitive_dispatch_and_crash_logs_are_safe(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_trusted_anton_route", _anton_route)
+    caplog.set_level("INFO", logger="tools.async_delegation")
+
+    def crash():
+        raise RuntimeError("token=sk_abcdefghijklmnopqrstuvwxyz /leak/path private-session secret result")
+
+    result = ad.dispatch_async_delegation(
+        goal="private goal token=sk_abcdefghijklmnopqrstuvwxyz", context="private context",
+        toolsets=None, role="leaf", model="m", session_key="private-session", runner=crash,
+    )
+    deadline = time.monotonic() + 3
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(.01)
+    logs = caplog.text
+    for forbidden in ("private goal", "private context", "private-session", "sk_", "/leak/path", "secret result"):
+        assert forbidden not in logs
+    assert "Dispatched ANTON async delegation" in logs
+    assert ad.get_durable_delegation(result["delegation_id"])["handoff_state"] == "pending"
+
+
+def test_anton_invalid_trusted_route_fails_before_runner_or_persistence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_trusted_anton_route", lambda: (_ for _ in ()).throw(ValueError("invalid route")))
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {}
+
+    with pytest.raises(ValueError, match="invalid route"):
+        ad.dispatch_async_delegation(goal="g", context=None, toolsets=None, role="leaf", model="m", session_key="s", runner=runner)
+    assert not called
+    with ad._DB_LOCK, ad._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+
+
+def test_anton_claims_are_fenced_hash_checked_and_corruption_fails_closed(tmp_path, monkeypatch):
+    _persist_anton_terminal(tmp_path, monkeypatch, "deleg_claimone")
+    claims = []
+    barrier = threading.Barrier(2)
+
+    def claimant():
+        barrier.wait()
+        claims.append(ad.claim_anton_handoffs(limit=1, lease_seconds=1))
+
+    threads = [threading.Thread(target=claimant) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(len(claim) for claim in claims) == [0, 1]
+    first = next(claim[0] for claim in claims if claim)
+    assert hashlib.sha256(first["body_json"].encode()).hexdigest() == first["body_sha256"]
+    assert ad.claim_anton_handoffs(limit=0) == []
+    assert not ad.release_anton_handoff(first["delegation_id"], "wrong", first["claim_version"])
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute("UPDATE async_delegations SET handoff_claim_expires_at=0 WHERE delegation_id=?", (first["delegation_id"],))
+    second = ad.claim_anton_handoffs(limit=1)[0]
+    assert second["claim_version"] == first["claim_version"] + 1
+    assert not ad.release_anton_handoff(first["delegation_id"], first["claim_token"], first["claim_version"])
+    assert not ad.mark_anton_handoff_completed(first["delegation_id"], first["claim_token"], first["claim_version"])
+    assert ad.release_anton_handoff(second["delegation_id"], second["claim_token"], second["claim_version"])
+    corrupt = _persist_anton_terminal(tmp_path, monkeypatch, "deleg_corrupt")
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute("UPDATE async_delegations SET anton_body_sha256='bad' WHERE delegation_id=?", (corrupt["delegation_id"],))
+    assert ad.claim_anton_handoffs(limit=2) == []
+    assert ad.get_durable_delegation(corrupt["delegation_id"])["handoff_state"] == "pending"
+
+
+def test_anton_handoffs_cannot_enter_generic_session_delivery_rail(tmp_path, monkeypatch):
+    record = _persist_anton_terminal(tmp_path, monkeypatch, "deleg_anton_isolated")
+
+    assert not ad.claim_completion_delivery(record["delegation_id"], "malformed-session-claim")
+    assert not ad.release_completion_delivery(record["delegation_id"], "malformed-session-claim")
+    assert not ad.mark_completion_delivered(record["delegation_id"])
+    assert not ad.complete_completion_delivery(record["delegation_id"], "malformed-session-claim")
+    durable = ad.get_durable_delegation(record["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "pending"
+    assert durable["handoff_state"] == "pending"
+
+    claimed = ad.claim_anton_handoffs(limit=1)
+    assert [handoff["delegation_id"] for handoff in claimed] == [record["delegation_id"]]
+
+
+def test_anton_owner_loss_is_unknown_once_without_session_queue(tmp_path, monkeypatch):
+    record = _persist_anton_terminal(tmp_path, monkeypatch, "deleg_owner")
+    # Restore it to a running ANTON row, simulating a process crash before finalization.
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute("UPDATE async_delegations SET state='running', completed_at=NULL, handoff_state=NULL, owner_pid=99999999, owner_started_at=NULL WHERE delegation_id=?", (record["delegation_id"],))
+    assert ad.recover_abandoned_delegations() == 1
+    assert ad.recover_abandoned_delegations() == 0
+    durable = ad.get_durable_delegation(record["delegation_id"])
+    assert durable["state"] == "unknown" and durable["handoff_state"] == "pending"
+    assert json.loads(durable["anton_body_json"])["status"] == "unknown"
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_anton_pruning_excludes_protected_handoffs_but_allows_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 10)
+    generic = {"delegation_id": "deleg_generic", "session_key": "s", "origin_ui_session_id": "", "parent_session_id": None, "dispatched_at": 1.0}
+    ad._persist_dispatch(generic)
+    ad._persist_completion({"delegation_id": "deleg_generic", "status": "completed", "completed_at": 1.0}, {"summary": "generic"})
+    protected = _persist_anton_terminal(tmp_path, monkeypatch, "deleg_protected")
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    ad._prune_durable_records()
+    assert ad.get_durable_delegation("deleg_generic") is not None
+    assert ad.get_durable_delegation(protected["delegation_id"]) is not None
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute("UPDATE async_delegations SET handoff_state='completed' WHERE delegation_id=?", (protected["delegation_id"],))
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 0)
+    ad._prune_durable_records()
+    assert ad.get_durable_delegation(protected["delegation_id"]) is None
+
+
+def test_legacy_schema_migrates_preserves_row_and_adds_handoff_indexes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = tmp_path / "state.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY, origin_session TEXT NOT NULL,
+            origin_ui_session_id TEXT NOT NULL DEFAULT '', parent_session_id TEXT,
+            state TEXT NOT NULL, dispatched_at REAL NOT NULL, completed_at REAL,
+            updated_at REAL NOT NULL, event_json TEXT, result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending', delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL)""")
+        conn.execute("INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at) VALUES ('deleg_legacy', 'legacy', 'completed', 1, 1)")
+    with ad._DB_LOCK, ad._connect() as conn:
+        row = conn.execute("SELECT origin_session, delivery_kind, handoff_claim_version FROM async_delegations WHERE delegation_id='deleg_legacy'").fetchone()
+        indexes = {item[1] for item in conn.execute("PRAGMA index_list(async_delegations)")}
+    assert row == ("legacy", "session", 0)
+    assert {"idx_async_delegations_delivery_id", "idx_async_delegations_anton_handoff_due", "idx_async_delegations_anton_terminal"} <= indexes
 
 

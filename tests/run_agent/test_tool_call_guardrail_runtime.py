@@ -5,6 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -36,7 +38,12 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
+def _make_agent(
+    *tool_names: str,
+    max_iterations: int = 10,
+    config: dict | None = None,
+    restricted_execution: bool = False,
+) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -50,6 +57,7 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            restricted_execution=restricted_execution,
         )
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
@@ -353,3 +361,51 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+@pytest.mark.parametrize("executor", [
+    "_execute_tool_calls_concurrent",
+    "_execute_tool_calls_sequential",
+    "segmented",
+])
+def test_restricted_agent_rejects_fabricated_tool_calls_before_dispatch(executor, monkeypatch):
+    """All dispatch paths fail closed without middleware, hooks, or tools."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "restricted-task")
+    agent = _make_agent("web_search", restricted_execution=True)
+    call = _mock_tool_call("fabricated_tool", "{}", "fabricated-1")
+    message = SimpleNamespace(content="", tool_calls=[call])
+    messages = []
+    agent.tool_start_callback = MagicMock()
+    agent.tool_progress_callback = MagicMock()
+
+    with patch("run_agent.handle_function_call") as implementation:
+        if executor == "segmented":
+            from agent.tool_executor import execute_tool_calls_segmented
+            execute_tool_calls_segmented(agent, message, messages, "task-1")
+        else:
+            getattr(agent, executor)(message, messages, "task-1")
+
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert agent._kanban_worker_guidance == ""
+    implementation.assert_not_called()
+    agent.tool_start_callback.assert_not_called()
+    agent.tool_progress_callback.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == "fabricated-1"
+    assert "restricted to synthesis only" in messages[0]["content"]
+
+
+def test_ordinary_agent_tool_dispatch_remains_enabled():
+    agent = _make_agent("web_search")
+    call = _mock_tool_call("web_search", '{"query":"safe"}', "ordinary-1")
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value='{"ok":true}') as implementation:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]), messages, "task-1"
+        )
+
+    implementation.assert_called_once()
+    assert messages[0]["tool_call_id"] == "ordinary-1"

@@ -103,10 +103,21 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from gateway.platforms.run_files import RunFileError, RunFileStore, owner_digest
+from gateway.anton_origin_v2 import (
+    AntonOriginV2Error,
+    MAX_BODY_BYTES as ANTON_ORIGIN_V2_MAX_REQUEST_BYTES,
+    envelope_present as _anton_origin_v2_envelope_present,
+    validate_synthesize_continuation as _validate_synthesize_continuation,
+    verify as _verify_anton_origin_v2,
+)
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+# Never reflect private continuation context in a failure. This literal is
+# intentionally independent of provider output and the signed payload.
+_SYNTHESIS_PRIVATE_OUTPUT_ERROR = "Synthesis output could not be safely delivered"
 
 
 class _RunEventEmitter:
@@ -188,6 +199,71 @@ ANTON_CRON_ORIGIN_NONCE_CACHE_MAX = 10_000
 _ANTON_CRON_ORIGIN_SIGNATURE_RE = re.compile(r"sha256=[0-9a-f]{64}\Z")
 _ANTON_CRON_ORIGIN_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 _anton_cron_origin_nonces = OrderedDict()
+
+
+def _anton_detached_completion_sink_ready() -> bool:
+    """Injectable fail-closed readiness seam for future durable delivery."""
+    try:
+        from hermes_plugins.anton_gateway.config import detached_completion_sink_ready
+        return bool(detached_completion_sink_ready())
+    except Exception:
+        return False
+
+
+async def _read_runs_raw_body(request: "web.Request") -> tuple[bytes, bool]:
+    """Bound signed-v2 reads before JSON parsing without changing generic Runs."""
+    if not _anton_origin_v2_envelope_present(request.headers):
+        return await request.read(), False
+    content_length = request.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            if int(content_length) > ANTON_ORIGIN_V2_MAX_REQUEST_BYTES:
+                return b"", True
+        except ValueError:
+            return b"", True
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await request.content.read(min(64 * 1024, ANTON_ORIGIN_V2_MAX_REQUEST_BYTES + 1 - size))
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > ANTON_ORIGIN_V2_MAX_REQUEST_BYTES:
+            return b"", True
+        chunks.append(chunk)
+    return b"".join(chunks), False
+
+
+def _anton_origin_v2_content_type_is_json_utf8(request: "web.Request") -> bool:
+    """Return whether the signed-v2 media type is JSON with only UTF-8 text."""
+    content_type = request.headers.get("Content-Type")
+    if not content_type:
+        return False
+    media_type, *parameter_parts = content_type.split(";")
+    if media_type.strip().lower() != "application/json":
+        return False
+    for part in parameter_parts:
+        if not part.strip():
+            return False
+        name, separator, value = part.partition("=")
+        if not separator or not name.strip() or not value.strip():
+            return False
+        if name.strip().lower() == "charset":
+            charset = value.strip().strip('"').lower()
+            if charset != "utf-8":
+                return False
+    return True
+
+
+def _anton_cron_origin_envelope_present(headers: Any) -> bool:
+    """Detect even a partial cron-v1 envelope so provenance cannot be mixed."""
+    return any(headers.get(name) is not None for name in (
+        "X-Anton-Cron-Origin-Version",
+        "X-Anton-Cron-Origin",
+        "X-Anton-Cron-Origin-Timestamp",
+        "X-Anton-Cron-Origin-Nonce",
+        "X-Anton-Cron-Origin-Signature",
+    ))
 
 
 def _verify_anton_cron_origin_headers(
@@ -1856,6 +1932,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        synthesize_only: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1949,13 +2026,23 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        # This is a request-local deny policy: synthesize-only never resolves
+        # configured toolsets, while every concurrent ordinary run remains unchanged.
+        enabled_toolsets = [] if synthesize_only else sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
+
+        # Defend direct construction paths as well as the Runs handler below.
+        if synthesize_only:
+            stream_delta_callback = None
+            interim_assistant_callback = None
+            tool_progress_callback = None
+            tool_start_callback = None
+            tool_complete_callback = None
 
         agent = AIAgent(
             model=model,
@@ -1976,6 +2063,10 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            # Per-request capability boundary; never mutate global tool config.
+            restricted_execution=synthesize_only,
+            skip_memory=synthesize_only,
+            skip_context_files=synthesize_only,
         )
         return agent
 
@@ -4649,16 +4740,16 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        _allow_async_delivery: bool = False,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
         This is the SINGLE structural chokepoint every API-server agent-entry
         path must use to seed session context — it hardwires
-        ``platform="api_server"`` and ``async_delivery=False`` so a new route
-        physically cannot reintroduce the silent-no-op bug (#10760) by
-        forgetting to mark the channel as non-delivering. There is no
-        ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        ``platform="api_server"`` and, by default, ``async_delivery=False`` so
+        a new route cannot reintroduce the silent-no-op bug (#10760).  The
+        private flag is reserved for a request that has authenticated ANTON v2
+        provenance and a ready durable completion sink.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -4672,7 +4763,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
-            async_delivery=False,
+            async_delivery=bool(_allow_async_delivery),
         )
 
     async def _run_agent(
@@ -4688,6 +4779,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        synthesize_only: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4704,6 +4796,14 @@ class APIServerAdapter(BasePlatformAdapter):
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
         """
+        # The exceptional synthesize-only route has no incremental public
+        # callback surface. Keep this request-local so ordinary Runs stream.
+        if synthesize_only:
+            stream_delta_callback = None
+            tool_progress_callback = None
+            tool_start_callback = None
+            tool_complete_callback = None
+
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
         # run_in_executor threads, so the profile scope must be re-entered
@@ -4718,6 +4818,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+
                 )
                 try:
                     agent = self._create_agent(
@@ -4729,6 +4830,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        synthesize_only=synthesize_only,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -5379,10 +5481,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if limited is not None:
             return limited
 
+        v2_envelope_present = _anton_origin_v2_envelope_present(request.headers)
+        if v2_envelope_present and not _anton_origin_v2_content_type_is_json_utf8(request):
+            return web.json_response(_openai_error("Invalid ANTON origin content type"), status=415)
+        if v2_envelope_present and _anton_cron_origin_envelope_present(request.headers):
+            return web.json_response(_openai_error("Ambiguous ANTON origin"), status=403)
+
         try:
-            raw_body = await request.read()
+            raw_body, v2_oversize = await _read_runs_raw_body(request)
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if v2_oversize:
+            return web.json_response(_openai_error("ANTON origin request too large"), status=413)
+
+        try:
+            verified_v2_origin = _verify_anton_origin_v2(request.headers, raw_body)
+        except AntonOriginV2Error:
+            return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
 
         origin_header, origin_err = _verify_anton_cron_origin_headers(request, raw_body)
         if origin_err is not None:
@@ -5392,14 +5507,55 @@ class APIServerAdapter(BasePlatformAdapter):
             body = json.loads(raw_body)
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if verified_v2_origin is not None and not isinstance(body, dict):
+            return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
 
         trusted_anton_origin = None
+        synthesize_only = False
+        continuation_prompt: Optional[str] = None
+        private_output_markers: tuple[str, ...] = ()
         if origin_header is not None:
             try:
                 from hermes_plugins.anton_gateway.origin_context import parse_origin
                 trusted_anton_origin = parse_origin(json.loads(origin_header))
             except Exception:
                 return web.json_response(_openai_error("Invalid ANTON cron origin"), status=403)
+
+        if verified_v2_origin is not None:
+            try:
+                from hermes_plugins.anton_gateway.origin_context import parse_v2_origin
+                trusted_anton_origin = parse_v2_origin(verified_v2_origin.context)
+            except Exception:
+                return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
+            if body.get("session_id") != trusted_anton_origin.hermes_session_id:
+                return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
+            synthesize_only = trusted_anton_origin.mode == "synthesize_only"
+
+        # ``antonContinuation`` is signed private control-plane input.  It is
+        # forbidden on every ordinary, legacy, absent-origin, and parent run.
+        has_continuation = isinstance(body, dict) and "antonContinuation" in body
+        if synthesize_only:
+            if not has_continuation:
+                return web.json_response(_openai_error("Invalid ANTON continuation"), status=400)
+            try:
+                continuation_prompt = _validate_synthesize_continuation(body["antonContinuation"])
+                # Keep markers only in this request closure. A blank summary is
+                # still protected by the complete generated private projection.
+                summary = body["antonContinuation"]["completion"]["summary"]
+                private_output_markers = tuple(
+                    marker for marker in (summary if summary else None, continuation_prompt)
+                    if isinstance(marker, str) and marker
+                )
+            except AntonOriginV2Error:
+                return web.json_response(_openai_error("Invalid ANTON continuation"), status=400)
+        elif has_continuation:
+            return web.json_response(_openai_error("Invalid ANTON continuation"), status=400)
+        if synthesize_only and (
+            not isinstance(body.get("attachments"), list) or body["attachments"] != []
+        ):
+            # Require the canonical empty list and never resolve or materialize
+            # file-backed input on a private, side-effect-free continuation.
+            return web.json_response(_openai_error("Invalid ANTON continuation"), status=400)
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -5417,7 +5573,7 @@ class APIServerAdapter(BasePlatformAdapter):
         attachment_ids = body.get("attachments")
         records = []
         file_owner = owner_digest(gateway_session_key) if gateway_session_key else ""
-        if attachment_ids is not None:
+        if attachment_ids is not None and not synthesize_only:
             try:
                 if not file_owner:
                     raise RunFileError("X-Hermes-Session-Key is required for attachments", "missing_session_key", 400)
@@ -5483,12 +5639,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+        if verified_v2_origin is not None:
+            try:
+                from hermes_plugins.anton_gateway.origin_context import bind_parent_run
+                trusted_anton_origin = bind_parent_run(trusted_anton_origin, run_id)
+            except Exception:
+                return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run. Client-provided session IDs are conversation scopes, not
         # authorization namespaces.
         approval_session_key = run_id
         artifact_dir: Optional[Path] = None
-        if file_owner:
+        if file_owner and not synthesize_only:
             artifact_dir = self._run_files.artifact_dir(run_id)
             self._run_file_owners[run_id] = file_owner
             artifact_instruction = (
@@ -5498,6 +5660,12 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             instructions = f"{str(instructions or '').strip()}\n\n{artifact_instruction}".strip()
         ephemeral_system_prompt = instructions
+        if continuation_prompt is not None:
+            # Deliberately request-local: this projection is never added to
+            # input/history/status/event/audit state and has no identifiers.
+            ephemeral_system_prompt = "\n\n".join(
+                item for item in (str(instructions or "").strip(), continuation_prompt) if item
+            )
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
@@ -5508,9 +5676,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_clarification_ids[run_id] = set()
 
         # Legacy progress remains only for non-lifecycle liveness updates;
-        # correlated tool callbacks are the sole lifecycle transport.
-        event_cb = self._make_run_event_callback(run_id, loop)
-        tool_start_cb, tool_complete_cb = self._make_run_tool_callbacks(run_id, loop)
+        # correlated tool callbacks are the sole lifecycle transport. Private
+        # synthesis owns no incremental public callback channel.
+        event_cb = None if synthesize_only else self._make_run_event_callback(run_id, loop)
+        if synthesize_only:
+            tool_start_cb = tool_complete_cb = None
+        else:
+            tool_start_cb, tool_complete_cb = self._make_run_tool_callbacks(run_id, loop)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
@@ -5519,7 +5691,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
+            if synthesize_only or delta is None:
                 return
             self._emit_run_event(run_id, {
                 "event": "message.delta",
@@ -5529,6 +5701,8 @@ class APIServerAdapter(BasePlatformAdapter):
             }, loop)
 
         def _interim_assistant_cb(text: Any, *, already_streamed: bool = False) -> None:
+            if synthesize_only:
+                return
             # Deltas remain private to the BFF history path. Therefore Runs
             # deliberately ignores the platform-rendering dedupe flag and emits
             # only explicitly public interim prose as a separate trace event.
@@ -5559,7 +5733,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         async def _run_and_close():
             try:
-                self._set_run_status(run_id, "running")
+                if not synthesize_only:
+                    self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -5576,13 +5751,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        interim_assistant_callback=_interim_assistant_cb,
+                        stream_delta_callback=None if synthesize_only else _text_cb,
+                        interim_assistant_callback=None if synthesize_only else _interim_assistant_cb,
                         tool_progress_callback=event_cb,
                         tool_start_callback=tool_start_cb,
                         tool_complete_callback=tool_complete_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        synthesize_only=synthesize_only,
                     )
                 self._active_run_agents[run_id] = agent
 
@@ -5664,6 +5840,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_tokens = []
                     with self._profile_scope(request_profile):
 
+
                         try:
                             if trusted_anton_origin is not None:
                                 from hermes_plugins.anton_gateway.origin_context import bind
@@ -5674,9 +5851,21 @@ class APIServerAdapter(BasePlatformAdapter):
                             approval_token = set_current_session_key(approval_session_key)
                             session_tokens = self._bind_api_server_session(
                                 session_key=approval_session_key,
+                                _allow_async_delivery=bool(
+                                    verified_v2_origin is not None
+                                    and trusted_anton_origin is not None
+                                    and trusted_anton_origin.mode == "parent_continuation"
+                                    and _anton_detached_completion_sink_ready()
+                                ),
                             )
-                            register_gateway_notify(approval_session_key, _approval_notify)
-                            agent.clarify_callback = _clarify_callback
+                            if synthesize_only:
+                                def _deny_private_control(*_args: Any, **_kwargs: Any) -> None:
+                                    raise RuntimeError("synthesize-only controls are disabled")
+                                agent.clarify_callback = _deny_private_control
+                                agent.approval_callback = _deny_private_control
+                            else:
+                                register_gateway_notify(approval_session_key, _approval_notify)
+                                agent.clarify_callback = _clarify_callback
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
@@ -5724,8 +5913,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                elif isinstance(result, dict) and (
+                    result.get("failed") or (synthesize_only and result.get("error"))
+                ):
+                    # A provider error can repeat the private continuation
+                    # projection verbatim. In synthesis mode it is tainted just
+                    # like final model text, so never redact-and-forward it.
+                    error_msg = (
+                        _SYNTHESIS_PRIVATE_OUTPUT_ERROR
+                        if synthesize_only
+                        else _redact_api_error_text(result.get("error") or "agent run failed")
+                    )
                     self._emit_run_event(run_id, {
                         "event": "run.failed",
                         "run_id": run_id,
@@ -5740,6 +5938,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    # Model output is untrusted with respect to the private
+                    # signed continuation. Fail closed before artifacts, status,
+                    # or run.completed can materialize any marker.
+                    if synthesize_only and any(
+                        marker in str(final_response) for marker in private_output_markers
+                    ):
+                        self._emit_run_event(run_id, {
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": _SYNTHESIS_PRIVATE_OUTPUT_ERROR,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "failed",
+                            error=_SYNTHESIS_PRIVATE_OUTPUT_ERROR,
+                            last_event="run.failed",
+                        )
+                        return
                     artifacts: list[dict[str, Any]] = []
                     if artifact_dir is not None and file_owner:
                         artifacts = self._run_files.collect_artifacts(run_id=run_id, owner=file_owner)
@@ -5785,18 +6002,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
                 raise
             except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
+                if synthesize_only:
+                    # Do not interpolate or attach the exception: its text may
+                    # contain request-private continuation context.
+                    logger.error("[api_server] private synthesis run failed")
+                    error_msg = _SYNTHESIS_PRIVATE_OUTPUT_ERROR
+                else:
+                    logger.exception("[api_server] run %s failed", run_id)
+                    error_msg = _redact_api_error_text(exc)
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=_redact_api_error_text(exc),
+                    error=error_msg,
                     last_event="run.failed",
                 )
                 self._emit_run_event(run_id, {
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "error": _redact_api_error_text(exc),
+                    "error": error_msg,
                 })
             finally:
                 # If the asyncio wrapper is cancelled (for example via

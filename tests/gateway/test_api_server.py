@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import base64
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -36,6 +37,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _read_runs_raw_body,
     _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
@@ -372,6 +374,33 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
+    def test_create_synthesis_agent_forwards_all_restriction_flags(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "openai", "base_url": "https://example.test/v1"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-test")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: {}))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: {"terminal"})
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(session_id="synthesis", synthesize_only=True)
+
+        assert captured["enabled_toolsets"] == []
+        assert captured["restricted_execution"] is True
+        assert captured["skip_memory"] is True
+        assert captured["skip_context_files"] is True
+
     def test_create_agent_refreshes_max_iterations_from_runtime_config(self, monkeypatch):
         captured = {}
 
@@ -657,6 +686,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post(
@@ -880,6 +911,626 @@ class TestAntonOriginRuns:
         async with TestClient(TestServer(app)) as cli:
             response = await cli.post("/v1/runs", headers=headers, data=body)
         assert response.status == 413
+
+
+def _anton_v2_headers(context: dict, body: bytes, *, key_id="origin-current", secret="origin-secret", nonce=None,
+                      content_type="application/json", context_raw: bytes | None = None):
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:23] + "Z"
+    nonce = nonce or base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    context_raw = context_raw if context_raw is not None else json.dumps(
+        context, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    context_b64 = base64.urlsafe_b64encode(context_raw).decode("ascii").rstrip("=")
+    digest = hashlib.sha256(body).hexdigest()
+    preimage = f"anton-run-origin-v2\nPOST\n/v1/runs\n{timestamp}\n{nonce}\n{key_id}\n{digest}\n{context_b64}\n"
+    signature = hmac.new(secret.encode(), preimage.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-Anton-Origin-Version": "anton-run-origin-v2",
+        "X-Anton-Origin-Key-Id": key_id,
+        "X-Anton-Origin-Timestamp": timestamp,
+        "X-Anton-Origin-Nonce": nonce,
+        "X-Anton-Origin-Body-SHA256": digest,
+        "X-Anton-Origin-Context": context_b64,
+        "X-Anton-Origin-Signature": signature,
+    }
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _anton_continuation(summary="HOSTILE_PRIVATE_MARKER"):
+    return {
+        "version": "hermes-delegation-completion-v1",
+        "deliveryId": "delivery_0123456789abcdef0123456789abcdef",
+        "delegationId": "deleg_0123abcd",
+        "parentRunId": "run_0123456789abcdef0123456789abcdef",
+        "parentSessionId": "anton-chat-0123456789abcdef0123456789abcdef",
+        "deliveryTarget": "anton:conversation_0123456789abcdef0123456789abcdef",
+        "status": "completed", "occurredAt": "2026-07-16T12:34:56.789Z",
+        "completion": {"summary": summary, "completedChildren": 1, "failedChildren": 0,
+                       "interruptedChildren": 0, "unknownChildren": 0},
+    }
+
+
+def _install_fake_anton_v2_context(monkeypatch):
+    from dataclasses import dataclass, replace
+
+    current = ContextVar("test_anton_v2_origin", default=None)
+
+    @dataclass(frozen=True)
+    class Origin:
+        hermes_session_id: str
+        mode: str
+        parent_run_id: str | None = None
+
+    origin_module = types.ModuleType("hermes_plugins.anton_gateway.origin_context")
+    origin_module.parse_origin = lambda value: value
+    origin_module.parse_v2_origin = lambda value: Origin(value["hermesSessionId"], value["mode"])
+    origin_module.bind_parent_run = lambda value, run_id: replace(value, parent_run_id=run_id)
+    origin_module.bind = current.set
+    origin_module.reset = current.reset
+    origin_module.get = current.get
+    plugins_module = types.ModuleType("hermes_plugins"); plugins_module.__path__ = []
+    anton_module = types.ModuleType("hermes_plugins.anton_gateway"); anton_module.__path__ = []
+    monkeypatch.setitem(sys.modules, "hermes_plugins", plugins_module)
+    monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway", anton_module)
+    monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway.origin_context", origin_module)
+    return current
+
+
+class TestAntonOriginV2Runs:
+    @staticmethod
+    def _context():
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        return session_id, {
+            "origin": "anton",
+            "originConversationId": "conversation_0123456789abcdef0123456789abcdef",
+            "hermesSessionId": session_id,
+            "protocol": "anton.delegation.v1",
+            "mode": "parent_continuation",
+        }
+
+    @staticmethod
+    def _enable_v2(monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("ANTON_RUN_ORIGIN_V2_ENABLED", "true")
+        monkeypatch.setenv("ANTON_RUN_ORIGIN_V2_CURRENT_KEY_ID", "origin-current")
+        monkeypatch.setenv("ANTON_RUN_ORIGIN_V2_CURRENT_SECRET", "origin-secret")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("ready", "expected_async"), [(True, True), (False, False)])
+    async def test_parent_mode_binds_generated_run_and_only_enables_async_when_ready(self, adapter, monkeypatch, tmp_path, ready, expected_async):
+        self._enable_v2(monkeypatch, tmp_path)
+        origin_context = _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "parent_continuation"}
+        body = json.dumps({"input": "hello", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+        observed = []
+        agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        def run(**_):
+            from gateway.session_context import async_delivery_supported
+            observed.append((origin_context.get(), async_delivery_supported()))
+            return {"final_response": "ok"}
+        agent.run_conversation.side_effect = run
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server._anton_detached_completion_sink_ready", return_value=ready):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    response = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+                    assert response.status == 202
+                    while adapter._active_run_tasks:
+                        await asyncio.sleep(0.01)
+        assert observed[0][0].parent_run_id.startswith("run_")
+        assert len(observed[0][0].parent_run_id) == 36
+        assert observed[0][1] is expected_async
+
+    @pytest.mark.asyncio
+    async def test_v2_session_mismatch_and_synthesize_only_fail_closed_for_async(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        bad_body = json.dumps({"input": "hello", "session_id": "other"}, sort_keys=True, separators=(",", ":")).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            assert (await cli.post("/v1/runs", data=bad_body, headers=_anton_v2_headers(context, bad_body))).status == 403
+        missing_body = json.dumps({"input": "hello", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            assert (await cli.post("/v1/runs", data=missing_body, headers=_anton_v2_headers(context, missing_body))).status == 400
+        body = json.dumps({
+            "input": "hello", "session_id": session_id, "conversation_history": [],
+            "attachments": [], "antonContinuation": _anton_continuation(),
+        }, sort_keys=True, separators=(",", ":")).encode()
+        observed = []
+        agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        def run(**_):
+            from gateway.session_context import async_delivery_supported
+            observed.append(async_delivery_supported()); return {"final_response": "ok"}
+        agent.run_conversation.side_effect = run
+        with patch("gateway.platforms.api_server._anton_detached_completion_sink_ready", return_value=True):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    assert (await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))).status == 202
+                    while adapter._active_run_tasks:
+                        await asyncio.sleep(0.01)
+        assert observed == [False]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("include_attachments", "attachments"),
+        [(False, None), (True, None), (True, {}), (True, "upload_1"), (True, ["upload_1"])],
+    )
+    async def test_synthesize_only_rejects_noncanonical_attachments_before_agent(
+        self, adapter, monkeypatch, tmp_path, include_attachments, attachments,
+    ):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {
+            "origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef",
+            "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only",
+        }
+        payload = {
+            "input": "continue", "session_id": session_id, "conversation_history": [],
+            "antonContinuation": _anton_continuation(),
+        }
+        if include_attachments:
+            payload["attachments"] = attachments
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                response = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+        assert response.status == 400
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode,include", [
+        ("synthesize_only", False), ("parent_continuation", True),
+    ])
+    async def test_continuation_presence_policy_rejects_before_agent(self, adapter, monkeypatch, tmp_path, mode, include):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": mode}
+        payload = {"input": "hello", "session_id": session_id}
+        if include:
+            payload["antonContinuation"] = _anton_continuation()
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                response = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+        assert response.status == 400
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_continuation_is_private_and_parent_policy_is_unchanged(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        synth_context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        captured = []
+
+        def make_agent(**kwargs):
+            agent = MagicMock()
+            agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            def run(**run_kwargs):
+                captured.append((kwargs, run_kwargs, agent.clarify_callback, agent.approval_callback))
+                return {"final_response": "ordinary public response"}
+            agent.run_conversation.side_effect = run
+            return agent
+
+        synth_body = json.dumps({
+            "input": "continue", "session_id": session_id, "conversation_history": [],
+            "attachments": [], "antonContinuation": _anton_continuation(),
+        }, sort_keys=True, separators=(",", ":")).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=make_agent), \
+                 patch.object(adapter._run_files, "resolve_uploads") as resolve_uploads:
+                started = await cli.post("/v1/runs", data=synth_body, headers=_anton_v2_headers(synth_context, synth_body))
+                assert started.status == 202
+                run_id = (await started.json())["run_id"]
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                get_response = await cli.get(f"/v1/runs/{run_id}")
+                assert get_response.status == 200
+                public_status = await get_response.json()
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_response.status == 200
+                public_events = await events_response.text()
+
+                parent_context = dict(synth_context, mode="parent_continuation")
+                parent_body = json.dumps({"input": "ordinary", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+                ordinary = await cli.post("/v1/runs", data=parent_body, headers=_anton_v2_headers(parent_context, parent_body))
+                assert ordinary.status == 202
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+
+        resolve_uploads.assert_not_called()
+        synth_kwargs, synth_run, clarify_callback, approval_callback = captured[0]
+        assert synth_kwargs["synthesize_only"] is True
+        assert "HOSTILE_PRIVATE_MARKER" in synth_kwargs["ephemeral_system_prompt"]
+        assert "delivery_" not in synth_kwargs["ephemeral_system_prompt"]
+        assert synth_run["user_message"] == "continue"
+        assert synth_run["conversation_history"] == []
+        with pytest.raises(RuntimeError):
+            clarify_callback("question", None)
+        with pytest.raises(RuntimeError):
+            approval_callback({})
+        public_wire = json.dumps(public_status)
+        assert "HOSTILE_PRIVATE_MARKER" not in public_wire
+        assert "HOSTILE_PRIVATE_MARKER" not in public_events
+        assert "antonContinuation" not in public_wire
+        assert "antonContinuation" not in public_events
+        assert public_status["output"] == "ordinary public response"
+        assert captured[1][0]["synthesize_only"] is False
+        assert "HOSTILE_PRIVATE_MARKER" not in str(captured[1][0].get("ephemeral_system_prompt") or "")
+
+    @pytest.mark.asyncio
+    async def test_synthesize_private_output_fails_closed_without_incremental_wire_events(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        marker = "HOSTILE_PRIVATE_MARKER"
+        body = json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation(marker)}, sort_keys=True, separators=(",", ":")).encode()
+        captured = {}
+        agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        agent.run_conversation.return_value = {"final_response": f"unsafe {marker}"}
+
+        def create_agent(**kwargs):
+            captured.update(kwargs)
+            return agent
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                started = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+                assert started.status == 202
+                run_id = (await started.json())["run_id"]
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                wire = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert captured["stream_delta_callback"] is None
+        assert captured["interim_assistant_callback"] is None
+        assert captured["tool_progress_callback"] is None
+        assert captured["tool_start_callback"] is None
+        assert captured["tool_complete_callback"] is None
+        assert status["status"] == "failed"
+        assert status["error"] == "Synthesis output could not be safely delivered"
+        assert "output" not in status and "artifacts" not in status
+        assert "run.failed" in wire and "run.completed" not in wire
+        assert "message.delta" not in wire and "assistant.commentary" not in wire
+        assert marker not in json.dumps(status) and marker not in wire
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["structured_failure", "exception"])
+    async def test_synthesize_failure_never_projects_provider_marker(
+        self, adapter, monkeypatch, tmp_path, caplog, outcome,
+    ):
+        """Both provider failure shapes are private on every Runs surface."""
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        marker = f"HOSTILE_PROVIDER_{outcome.upper()}"
+        body = json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation()}, sort_keys=True, separators=(",", ":")).encode()
+        agent = MagicMock()
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        if outcome == "structured_failure":
+            agent.run_conversation.return_value = {"failed": True, "error": marker}
+        else:
+            agent.run_conversation.side_effect = RuntimeError(marker)
+
+        app = _create_app(adapter)
+        with caplog.at_level("DEBUG", logger="gateway.platforms.api_server"):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    started = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+                    assert started.status == 202
+                    run_id = (await started.json())["run_id"]
+                    while adapter._active_run_tasks:
+                        await asyncio.sleep(0.01)
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    event_store = list(adapter._run_streams[run_id]._queue)
+                    wire = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert status["status"] == "failed"
+        assert status["error"] == "Synthesis output could not be safely delivered"
+        assert event_store and event_store[0]["event"] == "run.failed"
+        assert event_store[0]["error"] == "Synthesis output could not be safely delivered"
+        projection = "\n".join((json.dumps(status), json.dumps(event_store), wire, caplog.text))
+        assert marker not in projection
+
+    @pytest.mark.asyncio
+    async def test_synthesize_empty_summary_still_blocks_full_private_projection(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        body = json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation("")}, sort_keys=True, separators=(",", ":")).encode()
+        captured = {}
+        agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+        def create_agent(**kwargs):
+            captured.update(kwargs)
+            agent.run_conversation.return_value = {"final_response": kwargs["ephemeral_system_prompt"]}
+            return agent
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                started = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+                run_id = (await started.json())["run_id"]
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                wire = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert status["status"] == "failed"
+        assert captured["ephemeral_system_prompt"] not in wire
+        assert "Private delegation completion" not in wire
+
+    @pytest.mark.asyncio
+    async def test_synthesize_safe_output_completes_and_ordinary_run_keeps_callbacks(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        synth_context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        synth_body = json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation("")}, sort_keys=True, separators=(",", ":")).encode()
+        captured = []
+
+        def create_agent(**kwargs):
+            agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            agent.run_conversation.return_value = {"final_response": "safe completion"}
+            captured.append(kwargs)
+            return agent
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                started = await cli.post("/v1/runs", data=synth_body, headers=_anton_v2_headers(synth_context, synth_body))
+                run_id = (await started.json())["run_id"]
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                ordinary = await cli.post("/v1/runs", json={"input": "ordinary"})
+                assert ordinary.status == 202
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+
+        assert status["status"] == "completed" and status["output"] == "safe completion"
+        assert captured[0]["stream_delta_callback"] is None
+        assert captured[1]["stream_delta_callback"] is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", [None, "text/plain", "application/json; charset=iso-8859-1"])
+    async def test_v2_content_type_rejected_before_body_or_json_parse(self, adapter, monkeypatch, tmp_path, content_type):
+        self._enable_v2(monkeypatch, tmp_path)
+        session_id, context = self._context()
+        body = json.dumps({"input": "hello", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+        headers = _anton_v2_headers(context, body, content_type=content_type)
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server._read_runs_raw_body", new_callable=AsyncMock) as read_body, \
+             patch("gateway.platforms.api_server.json.loads") as parse_json, \
+             patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                if content_type is None:
+                    response = await cli.post(
+                        "/v1/runs", data=body, headers=headers, skip_auto_headers={"Content-Type"}
+                    )
+                else:
+                    response = await cli.post("/v1/runs", data=body, headers=headers)
+        assert response.status == 415
+        read_body.assert_not_awaited()
+        parse_json.assert_not_called()
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_v2_accepts_json_with_utf8_charset_and_parameters(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id, context = self._context()
+        body = json.dumps({"input": "hello", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+        agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        agent.run_conversation.return_value = {"final_response": "ok"}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post(
+                    "/v1/runs", data=body,
+                    headers=_anton_v2_headers(context, body, content_type="application/json; profile=anton; charset=UTF-8"),
+                )
+                assert response.status == 202
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+
+    @pytest.mark.asyncio
+    async def test_v2_declared_oversize_rejects_before_stream_read_or_parse(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        session_id, context = self._context()
+        body = b"x" * (256 * 1024 + 1)
+        headers = _anton_v2_headers(context, body)
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server.json.loads") as parse_json, \
+             patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", data=body, headers=headers)
+        assert response.status == 413
+        parse_json.assert_not_called()
+        create_agent.assert_not_called()
+
+        request = types.SimpleNamespace(
+            headers={**headers, "Content-Length": str(len(body))},
+            content=types.SimpleNamespace(read=AsyncMock(side_effect=AssertionError("must not read stream"))),
+        )
+        raw_body, oversized = await _read_runs_raw_body(request)
+        assert (raw_body, oversized) == (b"", True)
+        request.content.read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_v2_chunked_and_lying_small_content_length_reject_without_parse_or_agent(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        session_id, context = self._context()
+        body = b"x" * (256 * 1024 + 1)
+        headers = _anton_v2_headers(context, body)
+
+        async def chunked_body():
+            yield body[:64 * 1024]
+            yield body[64 * 1024:]
+
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server.json.loads") as parse_json, \
+             patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", data=chunked_body(), headers=headers)
+        assert response.status == 413
+        parse_json.assert_not_called()
+        create_agent.assert_not_called()
+
+        stream = types.SimpleNamespace(read=AsyncMock(side_effect=[b"x" * (256 * 1024), b"y", b""]))
+        request = types.SimpleNamespace(headers={**headers, "Content-Length": "1"}, content=stream)
+        raw_body, oversized = await _read_runs_raw_body(request)
+        assert (raw_body, oversized) == (b"", True)
+        assert stream.read.await_count == 2
+
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server._read_runs_raw_body", new=AsyncMock(return_value=(b"", True))), \
+             patch("gateway.platforms.api_server.json.loads") as parse_json, \
+             patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", data=b"{}", headers=_anton_v2_headers(context, b"{}"))
+        assert response.status == 413
+        parse_json.assert_not_called()
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_v2_exactly_256_kib_reaches_normal_json_validation(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _, context = self._context()
+        body = b"x" * (256 * 1024)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+        assert response.status == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["parent_continuation", "synthesize_only"])
+    async def test_v2_signed_runs_body_requires_canonical_bytes_before_agent_or_nonce(self, adapter, monkeypatch, tmp_path, mode):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {
+            "origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef",
+            "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": mode,
+        }
+        payload = {"session_id": session_id, "input": "hello"}
+        if mode == "synthesize_only":
+            payload.update(conversation_history=[], attachments=[], antonContinuation=_anton_continuation())
+        noncanonical = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        assert noncanonical != canonical
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                rejected = await cli.post("/v1/runs", data=noncanonical, headers=_anton_v2_headers(context, noncanonical))
+            assert rejected.status == 403
+            assert (await rejected.json())["error"]["message"] == "Invalid ANTON origin"
+            create_agent.assert_not_called()
+            assert not (tmp_path / "anton_origin_v2_replay.sqlite3").exists()
+
+            agent = MagicMock()
+            agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            agent.run_conversation.return_value = {"final_response": "ok"}
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                accepted = await cli.post("/v1/runs", data=canonical, headers=_anton_v2_headers(context, canonical))
+            assert accepted.status == 202
+            while adapter._active_run_tasks:
+                await asyncio.sleep(0.01)
+
+    @pytest.mark.asyncio
+    async def test_unsigned_ordinary_runs_keeps_noncanonical_json_behavior(self, adapter):
+        body = b'{"session_id":"ordinary","input":"hello"}'
+        agent = MagicMock()
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        agent.run_conversation.return_value = {"final_response": "ok"}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post("/v1/runs", data=body)
+            assert response.status == 202
+            while adapter._active_run_tasks:
+                await asyncio.sleep(0.01)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["parent_continuation", "synthesize_only"])
+    async def test_v2_nonfinite_body_is_403_before_nonce_or_agent(self, adapter, monkeypatch, tmp_path, mode):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id, context = self._context()
+        context["mode"] = mode
+        payload = {"input": "continue", "session_id": session_id}
+        if mode == "synthesize_only":
+            payload.update({
+                "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation(),
+            })
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        nonfinite = canonical.replace(b'"input":"continue"', b'"input":1e9999')
+        assert nonfinite != canonical
+        claimed = []
+        monkeypatch.setattr("gateway.anton_origin_v2._claim_nonce", lambda *args, **kwargs: claimed.append(args) or True)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                rejected = await cli.post("/v1/runs", data=nonfinite, headers=_anton_v2_headers(context, nonfinite))
+        assert rejected.status == 403
+        assert claimed == []
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_v2_nonfinite_context_is_403_before_nonce_or_agent(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id, context = self._context()
+        body = json.dumps({"input": "hello", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+        claimed = []
+        monkeypatch.setattr("gateway.anton_origin_v2._claim_nonce", lambda *args, **kwargs: claimed.append(args) or True)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                rejected = await cli.post(
+                    "/v1/runs", data=body,
+                    headers=_anton_v2_headers(context, body, context_raw=b'{"origin":1e9999}'),
+                )
+        assert rejected.status == 403
+        assert claimed == []
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_v2_and_any_cron_envelope_are_rejected_as_ambiguous_before_body_parse(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        monkeypatch.setenv("ANTON_CRON_ORIGIN_HMAC_KEY", "anton-test-key")
+        session_id, context = self._context()
+        body = json.dumps({"input": "hello", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+        headers = _anton_v2_headers(context, body)
+        headers.update(_anton_origin_headers("{}", datetime.now(timezone.utc).isoformat(), body))
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server._read_runs_raw_body", new_callable=AsyncMock) as read_body, \
+             patch("gateway.platforms.api_server.json.loads") as parse_json, \
+             patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", data=body, headers=headers)
+        assert response.status == 403
+        read_body.assert_not_awaited()
+        parse_json.assert_not_called()
+        create_agent.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,20 @@ class TestLegitimateFreshBuild:
         agent._build_system_prompt.assert_called_once()
         assert agent._cached_system_prompt == "BUILT_PROMPT"
 
+    def test_restricted_build_skips_session_plugin_and_credit_hooks(self, monkeypatch):
+        """Restricted synthesis has no session-start plugin or account I/O."""
+        agent = _make_agent(session_db=None)
+        agent.restricted_execution = True
+        hooks = MagicMock()
+        seed_credits = MagicMock()
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hooks)
+        monkeypatch.setattr("agent.credits_tracker.seed_credits_at_session_start", seed_credits)
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        hooks.assert_not_called()
+        seed_credits.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Silent-failure recovery — these are the new A/B logging paths

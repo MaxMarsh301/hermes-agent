@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -10,10 +11,37 @@ from urllib.parse import urlsplit
 # The scheduler's live-adapter wait budget is deliberately larger than this
 # transport attempt limit, but remains below the outbox lease duration.
 MAX_TRANSPORT_TIMEOUT_SECONDS = 120.0
+KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _enabled() -> bool:
     return os.getenv("ANTON_GATEWAY_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def detached_completion_sink_ready() -> bool:
+    """Return only a fail-closed configuration readiness signal for Runs v2.
+
+    This does not claim an outbox or attempt a delivery.  It is the pre-claim
+    capability gate for the durable delegation sender and adapter lifecycle.
+    """
+    if not (_enabled() and _flag("ANTON_RUN_ORIGIN_V2_ENABLED") and _flag("ANTON_DELEGATION_DELIVERY_ENABLED")):
+        return False
+    try:
+        # Reuse the sender's full, delegation-only validation so readiness and
+        # delivery cannot disagree about URL, timeout, or delegation key state.
+        # delegation_from_env deliberately does not call this readiness gate.
+        AntonConfig.delegation_from_env()
+    except ValueError:
+        return False
+    origin_key_id = os.getenv("ANTON_RUN_ORIGIN_V2_CURRENT_KEY_ID", "")
+    return (
+        bool(KEY_ID_RE.fullmatch(origin_key_id))
+        and bool(os.getenv("ANTON_RUN_ORIGIN_V2_CURRENT_SECRET", "").strip())
+    )
 
 
 def _allow_insecure_http() -> bool:
@@ -73,6 +101,38 @@ class AntonConfig:
     timeout: float = 10.0
     enabled: bool = False
     allow_insecure_http: bool = False
+    delegation_delivery_key: str = ""
+    delegation_delivery_key_id: str = ""
+
+    @classmethod
+    def delegation_from_env(cls) -> "AntonConfig":
+        """Load only the callback sender's purpose-separated configuration.
+
+        Cron resolver/delivery credentials intentionally play no part in this
+        constructor; their legacy validation remains in :meth:`from_env`.
+        """
+        try:
+            timeout = float(os.getenv("ANTON_GATEWAY_TIMEOUT", "10"))
+        except ValueError as exc:
+            raise ValueError("invalid ANTON gateway timeout") from exc
+        config = cls(
+            base_url=os.getenv("ANTON_GATEWAY_URL", "").rstrip("/"),
+            resolver_key="", delivery_key="", resolver_key_id="", delivery_key_id="",
+            timeout=timeout, enabled=_enabled(), allow_insecure_http=_allow_insecure_http(),
+            delegation_delivery_key=os.getenv("ANTON_DELEGATION_DELIVERY_CURRENT_SECRET", ""),
+            delegation_delivery_key_id=os.getenv("ANTON_DELEGATION_DELIVERY_CURRENT_KEY_ID", ""),
+        )
+        if not config.enabled or not _flag("ANTON_DELEGATION_DELIVERY_ENABLED"):
+            raise ValueError("ANTON delegation delivery is disabled")
+        if config.timeout <= 0 or config.timeout > MAX_TRANSPORT_TIMEOUT_SECONDS:
+            raise ValueError("invalid ANTON gateway timeout")
+        try:
+            validate_base_url(config.base_url, allow_insecure_http=config.allow_insecure_http)
+        except ValueError as exc:
+            raise ValueError("ANTON delegation delivery configuration is incomplete") from exc
+        if not config.delegation_delivery_key.strip() or not KEY_ID_RE.fullmatch(config.delegation_delivery_key_id):
+            raise ValueError("ANTON delegation delivery configuration is incomplete")
+        return config
 
     @classmethod
     def from_env(cls) -> "AntonConfig":
@@ -86,6 +146,8 @@ class AntonConfig:
             timeout=float(os.getenv("ANTON_GATEWAY_TIMEOUT", "10")),
             enabled=enabled,
             allow_insecure_http=_allow_insecure_http(),
+            delegation_delivery_key=os.getenv("ANTON_DELEGATION_DELIVERY_CURRENT_SECRET", ""),
+            delegation_delivery_key_id=os.getenv("ANTON_DELEGATION_DELIVERY_CURRENT_KEY_ID", ""),
         )
         if config.timeout <= 0 or config.timeout > MAX_TRANSPORT_TIMEOUT_SECONDS:
             raise ValueError("invalid ANTON gateway timeout")

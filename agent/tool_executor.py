@@ -187,6 +187,21 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _reject_restricted_tool_calls(agent, tool_calls, messages: list) -> bool:
+    """Fail closed before middleware, hooks, or any tool implementation runs."""
+    if not getattr(agent, "restricted_execution", False):
+        return False
+    for tool_call in tool_calls:
+        name = getattr(getattr(tool_call, "function", None), "name", "tool")
+        messages.append(make_tool_result_message(
+            name,
+            "[Tool execution rejected: this request is restricted to synthesis only]",
+            tool_call.id,
+            effect_disposition="none",
+        ))
+    return True
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -335,6 +350,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
     tool_calls = assistant_message.tool_calls
+    if _reject_restricted_tool_calls(agent, tool_calls, messages):
+        return
     num_tools = len(tool_calls)
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
@@ -1032,6 +1049,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
+    if _reject_restricted_tool_calls(agent, assistant_message.tool_calls, messages):
+        return
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
@@ -1763,6 +1782,9 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     tool_call_id.
     """
     from types import SimpleNamespace
+
+    if _reject_restricted_tool_calls(agent, assistant_message.tool_calls, messages):
+        return
 
     if segments is None:
         _active_env = get_active_env(effective_task_id)
