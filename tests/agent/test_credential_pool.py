@@ -9,6 +9,13 @@ from datetime import datetime, timezone
 
 import pytest
 
+from agent.credential_pool import _parse_absolute_timestamp
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), "NaN", "Infinity", "-Infinity"])
+def test_parse_absolute_timestamp_rejects_non_finite_values(value):
+    assert _parse_absolute_timestamp(value) is None
+
 
 def _write_auth_store(tmp_path, payload: dict) -> None:
     hermes_home = tmp_path / "hermes"

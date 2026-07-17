@@ -6411,7 +6411,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         try:
                             from agent.title_generator import generate_title
                             title = await asyncio.wait_for(
-                                asyncio.to_thread(generate_title, user_message, final_response),
+                                asyncio.to_thread(
+                                    generate_title, user_message, final_response, timeout=8.0,
+                                ),
                                 timeout=8.0,
                             )
                             if isinstance(title, str) and title.strip():

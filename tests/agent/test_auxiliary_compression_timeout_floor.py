@@ -25,7 +25,12 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from agent.auxiliary_client import call_llm, async_call_llm
+from agent.auxiliary_client import (
+    _effective_aux_timeout,
+    _get_task_timeout,
+    async_call_llm,
+    call_llm,
+)
 
 # The committed bounded floor for config-derived compression timeouts.
 # Behaviour contract (see AGENTS.md "Behavior contracts over snapshots"):
@@ -36,6 +41,21 @@ COMPRESSION_TIMEOUT_FLOOR = 300.0
 # The default ``auxiliary.compression.timeout`` shipped in the config schema
 # (hermes_cli/config.py).  Simulated here as the config-derived value.
 COMPRESSION_CONFIG_TIMEOUT = 120.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 0, -1])
+def test_configured_auxiliary_timeout_rejects_non_finite_or_non_positive(monkeypatch, value):
+    monkeypatch.setattr(
+        "agent.auxiliary_client._get_auxiliary_task_config",
+        lambda _task: {"timeout": value},
+    )
+    assert _get_task_timeout("title_generation", default=17.0) == 17.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 0, -1])
+def test_explicit_auxiliary_timeout_rejects_non_finite_or_non_positive(monkeypatch, value):
+    monkeypatch.setattr("agent.auxiliary_client._get_task_timeout", lambda _task: 23.0)
+    assert _effective_aux_timeout("title_generation", value) == 23.0
 
 
 def _ok_response():

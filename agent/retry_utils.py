@@ -69,23 +69,49 @@ def jittered_backoff(
     The jitter decorrelates concurrent retries so multiple sessions
     hitting the same provider don't all retry at the same instant.
     """
+    # Keep every retry delay finite even when a provider/config leaks NaN or
+    # infinity into the policy. Invalid values fall back to the established
+    # interactive defaults; a non-positive base retains the historical
+    # busy-wait guard by using the finite cap.
+    try:
+        safe_max = float(max_delay)
+    except (TypeError, ValueError, OverflowError):
+        safe_max = 120.0
+    if not math.isfinite(safe_max) or safe_max <= 0:
+        safe_max = 120.0
+    try:
+        safe_base = float(base_delay)
+    except (TypeError, ValueError, OverflowError):
+        safe_base = safe_max
+    if not math.isfinite(safe_base) or safe_base <= 0:
+        safe_base = safe_max
+    safe_base = min(safe_base, safe_max)
+    try:
+        safe_jitter_ratio = float(jitter_ratio)
+    except (TypeError, ValueError, OverflowError):
+        safe_jitter_ratio = 0.0
+    if not math.isfinite(safe_jitter_ratio):
+        safe_jitter_ratio = 0.0
+    safe_jitter_ratio = min(max(safe_jitter_ratio, 0.0), 1.0)
+
     global _jitter_counter
     with _jitter_lock:
         _jitter_counter += 1
         tick = _jitter_counter
 
     exponent = max(0, attempt - 1)
-    if exponent >= 63 or base_delay <= 0:
-        delay = max_delay
+    if exponent >= 63:
+        delay = safe_max
     else:
-        delay = min(base_delay * (2 ** exponent), max_delay)
+        delay = min(safe_base * (2 ** exponent), safe_max)
 
     # Seed from time + counter for decorrelation even with coarse clocks.
     seed = (time.time_ns() ^ (tick * 0x9E3779B9)) & 0xFFFFFFFF
     rng = random.Random(seed)
-    jitter = rng.uniform(0, jitter_ratio * delay)
+    jitter = rng.uniform(0, safe_jitter_ratio * delay)
 
-    return delay + jitter
+    result = delay + jitter
+    return result if math.isfinite(result) and result > 0 else safe_max
 
 
 def _error_text(error: Any) -> str:
