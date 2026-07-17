@@ -2560,3 +2560,32 @@ class TestApprovalPromptRedaction:
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+
+class TestExactGatewayApprovalIds:
+    def test_generated_id_matches_public_wire_contract(self):
+        approval_id = approval_module._new_approval_id()
+        assert approval_module._APPROVAL_ID_RE.fullmatch(approval_id)
+        assert approval_id.startswith("approval_")
+        assert len(approval_id.removeprefix("approval_")) == 32
+
+    @pytest.mark.parametrize("choice", ["once", "session", "deny"])
+    def test_exact_id_resolves_only_matching_pending_entry(self, choice):
+        session = "exact-id-test"
+        first_id = "approval_" + "A" * 32
+        second_id = "approval_" + "B" * 32
+        first = approval_module._ApprovalEntry({"approval_id": first_id, "command": "private one"})
+        second = approval_module._ApprovalEntry({"approval_id": second_id, "command": "private two"})
+        with approval_module._lock:
+            approval_module._gateway_queues[session] = [first, second]
+        try:
+            assert approval_module.resolve_gateway_approval_id(session, second_id, choice) == 1
+            assert second.result == choice and second.event.is_set()
+            assert first.result is None and not first.event.is_set()
+            # The same terminal response cannot overwrite the earlier result.
+            assert approval_module.resolve_gateway_approval_id(session, second_id, "deny") == 0
+            assert second.result == choice
+            assert approval_module.resolve_gateway_approval_id(session, "approval_" + "C" * 32, "deny") == 0
+        finally:
+            with approval_module._lock:
+                approval_module._gateway_queues.pop(session, None)
