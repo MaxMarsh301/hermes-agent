@@ -119,6 +119,46 @@ logger = logging.getLogger(__name__)
 # intentionally independent of provider output and the signed payload.
 _SYNTHESIS_PRIVATE_OUTPUT_ERROR = "Synthesis output could not be safely delivered"
 
+# A normalized fragment of this many alphanumeric codepoints is substantial
+# enough to be treated as private continuation disclosure. Continuation values
+# are already byte-bounded by validation, so this check is deterministic and
+# bounded by request input rather than a static prompt template.
+_SYNTHESIS_PRIVATE_FRAGMENT_CODEPOINTS = 12
+
+
+def _normalized_private_text(value: Any) -> str:
+    """NFKC/casefold text and remove non-alphanumeric separators."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in unicodedata.normalize("NFKC", value).casefold() if char.isalnum())
+
+
+def _synthesis_output_has_private_fragment(output: Any, private_values: tuple[str, ...]) -> bool:
+    """Fail closed on normalized private fragments without scanning the prompt.
+
+    Values shorter than the documented 12-codepoint threshold retain the
+    existing exact-containment policy after normalization. For longer values,
+    any contiguous 12-codepoint normalized fragment is enough to reject. The
+    caller intentionally supplies only request-private summary/correlation
+    values, never the static continuation prompt (which remains exact-guarded
+    separately).
+    """
+    normalized_output = _normalized_private_text(output)
+    if not normalized_output:
+        return False
+    for value in private_values:
+        normalized_value = _normalized_private_text(value)
+        if not normalized_value:
+            continue
+        if len(normalized_value) < _SYNTHESIS_PRIVATE_FRAGMENT_CODEPOINTS:
+            if normalized_value in normalized_output:
+                return True
+            continue
+        for start in range(len(normalized_value) - _SYNTHESIS_PRIVATE_FRAGMENT_CODEPOINTS + 1):
+            if normalized_value[start:start + _SYNTHESIS_PRIVATE_FRAGMENT_CODEPOINTS] in normalized_output:
+                return True
+    return False
+
 
 class _RunEventEmitter:
     """Serialize one run's cross-thread SSE events before they reach its queue."""
@@ -5514,6 +5554,7 @@ class APIServerAdapter(BasePlatformAdapter):
         synthesize_only = False
         continuation_prompt: Optional[str] = None
         private_output_markers: tuple[str, ...] = ()
+        private_correlation_values: tuple[str, ...] = ()
         if origin_header is not None:
             try:
                 from hermes_plugins.anton_gateway.origin_context import parse_origin
@@ -5545,6 +5586,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 private_output_markers = tuple(
                     marker for marker in (summary if summary else None, continuation_prompt)
                     if isinstance(marker, str) and marker
+                )
+                # Keep only request-private correlation values in this closure.
+                # They must never be logged or projected to Runs surfaces.
+                private_correlation_values = tuple(
+                    value for key, value in body["antonContinuation"].items()
+                    if key in {"deliveryId", "delegationId", "parentRunId", "parentSessionId", "deliveryTarget"}
+                    and isinstance(value, str) and value
                 )
             except AntonOriginV2Error:
                 return web.json_response(_openai_error("Invalid ANTON continuation"), status=400)
@@ -5941,8 +5989,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Model output is untrusted with respect to the private
                     # signed continuation. Fail closed before artifacts, status,
                     # or run.completed can materialize any marker.
-                    if synthesize_only and any(
-                        marker in str(final_response) for marker in private_output_markers
+                    if synthesize_only and (
+                        any(marker in str(final_response) for marker in private_output_markers)
+                        or _synthesis_output_has_private_fragment(
+                            final_response,
+                            ((summary,) if isinstance(summary, str) and summary else ())
+                            + private_correlation_values,
+                        )
                     ):
                         self._emit_run_event(run_id, {
                             "event": "run.failed",

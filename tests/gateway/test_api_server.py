@@ -1209,6 +1209,82 @@ class TestAntonOriginV2Runs:
         assert marker not in json.dumps(status) and marker not in wire
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("unsafe_output", [
+        "HOSTILE_PRIVATE",  # normalized prefix of the private summary
+        "FRAGMENT_ECHO",  # normalized suffix of the private summary
+        "hostile / private",  # casefolded and separator-split private fragment
+        "delivery01234",  # normalized fragment of a private correlation ID
+    ])
+    async def test_synthesize_private_summary_fragments_fail_closed_on_all_public_surfaces(
+        self, adapter, monkeypatch, tmp_path, caplog, unsafe_output,
+    ):
+        """A substantial private fragment must not reach status, SSE, store, logs, or artifacts."""
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        summary = "HOSTILE_PRIVATE_FRAGMENT_ECHO"
+        body = json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation(summary)}, sort_keys=True, separators=(",", ":")).encode()
+        agent = MagicMock()
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        agent.run_conversation.return_value = {"final_response": unsafe_output}
+        app = _create_app(adapter)
+        with caplog.at_level("DEBUG", logger="gateway.platforms.api_server"):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    started = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+                    run_id = (await started.json())["run_id"]
+                    while adapter._active_run_tasks:
+                        await asyncio.sleep(0.01)
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    stored_events = list(adapter._run_streams[run_id]._queue)
+                    wire = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        public_projection = "\n".join((json.dumps(status), json.dumps(stored_events), wire, caplog.text))
+        assert status["status"] == "failed"
+        assert status["error"] == "Synthesis output could not be safely delivered"
+        assert "output" not in status and "artifacts" not in status
+        assert stored_events and stored_events[0]["event"] == "run.failed"
+        assert "run.completed" not in wire
+        for private_fragment in ("HOSTILE_PRIVATE", "FRAGMENT_ECHO", "hostile / private", "delivery01234"):
+            assert private_fragment not in public_projection
+
+    @pytest.mark.asyncio
+    async def test_synthesize_safe_paraphrase_completes_but_ordinary_private_overlap_is_unchanged(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        body = json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation("HOSTILE_PRIVATE_FRAGMENT_ECHO")}, sort_keys=True, separators=(",", ":")).encode()
+        agents = []
+
+        def create_agent(**_kwargs):
+            agent = MagicMock()
+            agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            agent.run_conversation.return_value = {"final_response": "The delegated work finished safely." if not agents else "HOSTILE_PRIVATE"}
+            agents.append(agent)
+            return agent
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                started = await cli.post("/v1/runs", data=body, headers=_anton_v2_headers(context, body))
+                synth_run_id = (await started.json())["run_id"]
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                synth_status = await (await cli.get(f"/v1/runs/{synth_run_id}")).json()
+                ordinary = await cli.post("/v1/runs", json={"input": "ordinary"})
+                ordinary_run_id = (await ordinary.json())["run_id"]
+                while adapter._active_run_tasks:
+                    await asyncio.sleep(0.01)
+                ordinary_status = await (await cli.get(f"/v1/runs/{ordinary_run_id}")).json()
+
+        assert synth_status["status"] == "completed"
+        assert synth_status["output"] == "The delegated work finished safely."
+        assert ordinary_status["status"] == "completed"
+        assert ordinary_status["output"] == "HOSTILE_PRIVATE"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("outcome", ["structured_failure", "exception"])
     async def test_synthesize_failure_never_projects_provider_marker(
         self, adapter, monkeypatch, tmp_path, caplog, outcome,
