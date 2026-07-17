@@ -367,6 +367,8 @@ AUTHOR_MAP = {
     "290859878+synapsesx@users.noreply.github.com": "synapsesx",
     "157689911+itsflownium@users.noreply.github.com": "itsflownium",
     "dirtyren@users.noreply.github.com": "dirtyren",
+    "emodoteth@gmail.com": "emo-eth",
+    "wenzel.james.r@gmail.com": "emo-eth",
     "s96919@gmail.com": "s96919",
     "rasitakyol@hotmail.com": "rasitakyol",
     "thatgfsj@gmail.com": "Thatgfsj",
