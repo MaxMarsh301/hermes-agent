@@ -1492,10 +1492,17 @@ class TestMatrixAccessTokenAuth:
         mock_client.api.session.close = AsyncMock()
         fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
 
-        with patch.dict("sys.modules", fake_mautrix_mods):
-            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                    assert await asyncio.wait_for(adapter.connect(), timeout=1) is True
+        import plugins.platforms.matrix.adapter as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", fake_mautrix_mods):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        with patch.object(
+                            adapter, "_verify_device_keys_on_server", AsyncMock(return_value=True)
+                        ) as verify_device_keys:
+                            assert await asyncio.wait_for(adapter.connect(), timeout=1) is True
+
+        verify_device_keys.assert_awaited_once()
 
         await asyncio.wait_for(join_started.wait(), timeout=1)
         assert "!dead:example.org" in adapter._invite_join_tasks
@@ -1815,10 +1822,17 @@ class TestMatrixPasswordLoginDeviceId:
 
         fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
 
-        with patch.dict("sys.modules", fake_mautrix_mods):
-            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                    assert await adapter.connect() is True
+        import plugins.platforms.matrix.adapter as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", fake_mautrix_mods):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        with patch.object(
+                            adapter, "_verify_device_keys_on_server", AsyncMock(return_value=True)
+                        ) as verify_device_keys:
+                            assert await adapter.connect() is True
+
+        verify_device_keys.assert_awaited_once()
 
         mock_client.login.assert_awaited_once()
         assert adapter._device_id == "STABLE_PW_DEVICE"
