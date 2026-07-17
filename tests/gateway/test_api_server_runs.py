@@ -235,7 +235,9 @@ class TestStartRun:
                         await asyncio.sleep(0.02)
                     assert [event["event"] for event in first_events][-2:] == ["run.completed", "conversation.title"]
                     assert first_events[-1]["title"] == "Диагностика шлюза"
-                    generate.assert_called_once_with("Почему упал шлюз?", "Готовый ответ")
+                    generate.assert_called_once_with(
+                        "Почему упал шлюз?", "Готовый ответ", timeout=8.0,
+                    )
 
                     followup = await cli.post(
                         "/v1/runs",
