@@ -5,6 +5,7 @@ thundering-herd retry spikes when multiple sessions hit the same
 rate-limited provider concurrently.
 """
 
+import math
 import random
 import threading
 import time
@@ -31,6 +32,19 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 # long-tier entry is reachable). Keeping it a single module constant prevents
 # the two from silently desyncing if the short-retry count is ever tuned.
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
+
+
+def bounded_retry_after(value: Any, *, maximum: float = 600.0) -> float | None:
+    """Parse Retry-After without admitting NaN, infinities, or unbounded waits."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or not math.isfinite(maximum) or maximum <= 0:
+        return None
+    return min(parsed, maximum)
 
 
 def jittered_backoff(

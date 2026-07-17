@@ -60,6 +60,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    bounded_retry_after,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -1134,6 +1135,7 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
+        _provider_retry_visible = False
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
         max_compression_attempts = 3
@@ -1623,6 +1625,18 @@ def run_conversation(
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
+                    _provider_retry_visible = True
+                    _event_cb = getattr(agent, "event_callback", None)
+                    if _event_cb:
+                        try:
+                            _event_cb("provider:retry", {
+                                "attempt": retry_count,
+                                "max_attempts": max_retries,
+                                "delay_seconds": wait_time,
+                                "reason": "invalid_response",
+                            })
+                        except Exception:
+                            pass
                     logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                     
                     # Sleep in small increments to stay responsive to interrupts
@@ -4235,8 +4249,8 @@ def run_conversation(
                                 # retry before the actual reset window and re-trip the
                                 # limit. 600s covers all realistic provider reset
                                 # windows while still rejecting pathological values. (#26293)
-                                _retry_after = min(float(_ra_raw), 600)
-                            except (TypeError, ValueError):
+                                _retry_after = bounded_retry_after(_ra_raw, maximum=600.0)
+                            except (TypeError, ValueError, OverflowError):
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
@@ -4265,6 +4279,18 @@ def run_conversation(
                         agent._buffer_status(_rate_limit_status)
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                _provider_retry_visible = True
+                _event_cb = getattr(agent, "event_callback", None)
+                if _event_cb:
+                    try:
+                        _event_cb("provider:retry", {
+                            "attempt": retry_count,
+                            "max_attempts": max_retries,
+                            "delay_seconds": wait_time,
+                            "reason": "rate_limit" if is_rate_limited else "provider_error",
+                        })
+                    except Exception:
+                        pass
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,
@@ -4353,6 +4379,15 @@ def run_conversation(
             print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
             agent._persist_session(messages, conversation_history)
             break
+
+        if _provider_retry_visible:
+            _event_cb = getattr(agent, "event_callback", None)
+            if _event_cb:
+                try:
+                    _event_cb("provider:recovered", {})
+                except Exception:
+                    pass
+            _provider_retry_visible = False
 
         try:
             _transport = agent._get_transport()
