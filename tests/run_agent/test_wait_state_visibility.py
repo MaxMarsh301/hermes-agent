@@ -121,3 +121,51 @@ def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
     reconnect_notices = [s for s in seen if "reconnecting" in s]
     assert reconnect_notices, f"expected a reconnect wait-notice, saw: {seen}"
     assert "no response from provider" in reconnect_notices[0]
+
+
+def test_nonstream_wait_notice_handles_infinite_local_deadline(tmp_path, monkeypatch):
+    """The 30-second notice omits a reconnect time for local infinite deadlines."""
+    from agent import chat_completion_helpers as h
+
+    seen: list = []
+    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
+    agent.base_url = "http://127.0.0.1:8000/v1"
+    agent._base_url = agent.base_url
+    assert agent._compute_non_stream_stale_timeout({"model": "local-model"}) == float("inf")
+
+    polls = {"joins": 0}
+
+    class PollingThread:
+        def __init__(self, target, daemon):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return polls["joins"] < 101
+
+        def join(self, timeout=None):
+            polls["joins"] += 1
+
+    monkeypatch.setattr(h.threading, "Thread", PollingThread)
+    monkeypatch.setattr(h.time, "time", lambda: 0.0)
+
+    h.interruptible_api_call(agent, {"model": "local-model", "messages": []})
+
+    assert polls["joins"] >= 100
+    assert seen == [
+        "⏳ waiting on local-model — 0s with no response yet (provider may be slow "
+        "or overloaded; no automatic reconnect deadline)"
+    ]
+
+    seen.clear()
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 60.0)
+    polls["joins"] = 0
+
+    h.interruptible_api_call(agent, {"model": "test-model", "messages": []})
+
+    assert seen == [
+        "⏳ waiting on test-model — 0s with no response yet (provider may be slow "
+        "or overloaded; auto-reconnect at 60s)"
+    ]

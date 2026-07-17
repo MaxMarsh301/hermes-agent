@@ -6,6 +6,7 @@ adds latency to the user-facing reply.
 
 import logging
 import threading
+import unicodedata
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
@@ -32,6 +33,27 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
     "Write the title in {language}. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+
+_TITLE_INTERNAL_MARKERS = (
+    "<tool", "</tool", "<function", "</function", "<think", "</think",
+    "```", '"tool_calls"', '"arguments"',
+)
+
+
+def _sanitize_generated_title(value: str) -> Optional[str]:
+    """Return one compact display-only line, rejecting internal protocol fragments."""
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        return None
+    title = " ".join(value.split()).strip('"\'')
+    lowered = title.casefold()
+    if not title or any(marker in lowered for marker in _TITLE_INTERNAL_MARKERS):
+        return None
+    if title.lower().startswith("title:"):
+        title = title[6:].strip()
+    if len(title) > 80:
+        title = title[:77].rstrip() + "..."
+    return title or None
 
 
 def _title_language() -> str:
@@ -96,14 +118,7 @@ def generate_title(
         # are handled, not just a single literal <think> pair.
         from agent.agent_runtime_helpers import strip_think_blocks
         title = strip_think_blocks(None, content).strip()
-        # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
-        title = title.strip('"\'')
-        if title.lower().startswith("title:"):
-            title = title[6:].strip()
-        # Enforce reasonable length
-        if len(title) > 80:
-            title = title[:77] + "..."
-        return title if title else None
+        return _sanitize_generated_title(title)
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.

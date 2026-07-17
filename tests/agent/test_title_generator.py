@@ -7,12 +7,19 @@ from agent.title_generator import (
     generate_title,
     auto_title_session,
     maybe_auto_title,
+    _sanitize_generated_title,
     _title_language,
 )
 
 
 class TestGenerateTitle:
     """Unit tests for generate_title()."""
+
+    def test_sanitizer_rejects_internal_protocol_fragments_and_controls(self):
+        assert _sanitize_generated_title("Диагностика шлюза") == "Диагностика шлюза"
+        assert _sanitize_generated_title("<tool_call>read_file</tool_call>") is None
+        assert _sanitize_generated_title('{"tool_calls": [{"arguments": "secret"}]}') is None
+        assert _sanitize_generated_title("bad\x00title") is None
 
     def test_returns_title_on_success(self):
         mock_response = MagicMock()

@@ -33,7 +33,7 @@ Requires:
 
 import asyncio
 import base64
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -44,6 +44,7 @@ from contextvars import ContextVar
 from functools import wraps
 import keyword
 import logging
+import math
 import os
 import socket as _socket
 import re
@@ -60,9 +61,9 @@ from typing import Any, Dict, List, Optional
 import tokenize
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
-    if smart_denied:
-        return ["once", "deny"]
-    return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+    """Return the intentionally small public Runs approval choice contract."""
+    del smart_denied, allow_permanent
+    return ["once", "session", "deny"]
 
 
 try:
@@ -87,18 +88,70 @@ from gateway.readiness import collect_runtime_readiness
 logger = logging.getLogger(__name__)
 
 
-class _RunEventEmitter:
-    """Serialize one run's cross-thread SSE events before they reach its queue."""
+class _RunEventBuffer:
+    """Bounded, fan-out event log for one Runs SSE stream.
 
-    def __init__(self, loop: "asyncio.AbstractEventLoop", queue: "asyncio.Queue[Optional[Dict]]"):
+    All mutation happens on the owning event loop.  The emitter below schedules
+    mutations there, preserving sequence order when executor threads race.
+    """
+
+    def __init__(self, loop: "asyncio.AbstractEventLoop", *, max_events: int):
         self._loop = loop
-        self._queue = queue
+        self._events: "deque[Dict[str, Any]]" = deque(maxlen=max_events)
+        self._condition = asyncio.Condition()
+        self._closed = False
+        # One scheduled wake is sufficient for any number of appends before
+        # waiters next run. Without this latch a producer burst creates one
+        # pending Task per event even though every task only does notify_all().
+        self._notify_task: Optional[asyncio.Task] = None
+
+    def append(self, event: Dict[str, Any]) -> None:
+        self._events.append(event)
+        self._notify()
+
+    def close(self) -> None:
+        self._closed = True
+        self._notify()
+
+    def events_after(self, seq: int) -> list[Dict[str, Any]]:
+        return [event for event in self._events if int(event.get("seq", 0)) > seq]
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _notify(self) -> None:
+        if self._notify_task is not None and not self._notify_task.done():
+            return
+
+        async def _wake() -> None:
+            try:
+                async with self._condition:
+                    self._condition.notify_all()
+            finally:
+                self._notify_task = None
+
+        self._notify_task = self._loop.create_task(_wake())
+
+    async def wait_for_update(self, seq: int, timeout: float) -> None:
+        async with self._condition:
+            if self._closed or self.events_after(seq):
+                return
+            await asyncio.wait_for(self._condition.wait(), timeout=timeout)
+
+
+class _RunEventEmitter:
+    """Serialize one run's cross-thread SSE events before they reach its transport."""
+
+    def __init__(self, loop: "asyncio.AbstractEventLoop", stream: Any):
+        self._loop = loop
+        self._stream = stream
         self._lock = threading.Lock()
         self._next_seq = 1
         self._closed = False
 
     def emit(self, event: Dict[str, Any]) -> bool:
-        """Assign a sequence and enqueue without waiting for the event loop."""
+        """Assign a sequence and append without waiting for the event loop."""
         with self._lock:
             if self._closed:
                 return False
@@ -106,22 +159,30 @@ class _RunEventEmitter:
             payload["seq"] = self._next_seq
             self._next_seq += 1
             try:
-                # Scheduling while locked makes queue order equal seq even when
+                # Scheduling while locked makes stream order equal seq even when
                 # executor and event-loop threads race each other.
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+                if isinstance(self._stream, _RunEventBuffer):
+                    self._loop.call_soon_threadsafe(self._stream.append, payload)
+                else:
+                    # Compatibility with callback-focused tests that install a
+                    # raw queue directly.
+                    self._loop.call_soon_threadsafe(self._stream.put_nowait, payload)
             except Exception:
                 return False
             return True
 
     def close(self, *, signal: bool = True) -> bool:
-        """Close the emitter and optionally queue the terminal SSE sentinel."""
+        """Close the emitter and wake all replay subscribers."""
         with self._lock:
             if self._closed:
                 return False
             self._closed = True
             if signal:
                 try:
-                    self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
+                    if isinstance(self._stream, _RunEventBuffer):
+                        self._loop.call_soon_threadsafe(self._stream.close)
+                    else:
+                        self._loop.call_soon_threadsafe(self._stream.put_nowait, None)
                 except Exception:
                     pass
             return True
@@ -781,6 +842,100 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     return redacted
 
 
+# This must match tools.approval._APPROVAL_ID_RE exactly: the manager allocates
+# the opaque public token before notification and is the authority that settles
+# it. Runs never synthesizes a parallel public-ID namespace.
+_PUBLIC_APPROVAL_ID_RE = re.compile(r"approval_[A-Za-z0-9_-]{32}\Z")
+_PUBLIC_APPROVAL_ACTION = "terminal.command"
+_PUBLIC_APPROVAL_RISK_CODE = "other_dangerous_action"
+_PUBLIC_APPROVAL_SUMMARY = "Выполнить действие в терминале"
+_PUBLIC_APPROVAL_PURPOSE = "Подтвердить потенциально опасное действие для текущей задачи"
+_PUBLIC_APPROVAL_PRIVATE_RE = re.compile(
+    r"<\s*/?\s*(?:think|reasoning|analysis|scratchpad|memory(?:-context)?)\b|"
+    r"(?:https?|wss?|ftp|file)://|(?:^|[\s=(])(?:[A-Za-z]:[\\/]|/|~[/\\])|"
+    r"(?:^|\s)(?:sudo|bash|sh|zsh|curl|wget|rm|git|python(?:3)?)(?:\s|$)|"
+    r"(?:authorization|cookie|api[_-]?key|token|password|secret)\s*[:=]",
+    re.IGNORECASE,
+)
+
+
+def _public_approval_text(value: str, fallback: str) -> str:
+    """Sanitize a public approval label or fail closed to a static phrase."""
+    try:
+        text = unicodedata.normalize("NFKC", str(value))
+        text = redact_sensitive_text(text, force=True)
+        text = "".join("" if unicodedata.category(ch).startswith("C") else ch for ch in text)
+        text = " ".join(text.split()).strip()
+        if not text or len(text) > 180 or _PUBLIC_APPROVAL_PRIVATE_RE.search(text):
+            return fallback
+        return text
+    except Exception:
+        return fallback
+
+
+_PUBLIC_APPROVAL_COMMAND_PREVIEW_MAX_BYTES = 2048
+_PUBLIC_APPROVAL_COMMAND_PREVIEW_MAX_LINES = 12
+
+
+def _public_approval_command_preview(approval_data: Any) -> tuple[Optional[str], bool]:
+    """Return a forced-redacted, bounded preview of the exact pending command."""
+    command = approval_data.get("command") if isinstance(approval_data, dict) else None
+    if not isinstance(command, str) or not command:
+        return None, False
+    try:
+        # Keep shell layout useful, but do not allow terminal escape/control
+        # sequences through the public control-plane event.
+        preview = unicodedata.normalize("NFKC", command).replace("\r\n", "\n").replace("\r", "\n")
+        preview = redact_sensitive_text(preview, force=True)
+        preview = "".join(
+            char for char in preview
+            if char in {"\n", "\t"} or not unicodedata.category(char).startswith("C")
+        )
+    except Exception:
+        # A failed redactor must not degrade to the raw execution command.
+        return None, False
+    if not preview:
+        return None, False
+
+    lines = preview.split("\n")
+    truncated = len(lines) > _PUBLIC_APPROVAL_COMMAND_PREVIEW_MAX_LINES
+    preview = "\n".join(lines[:_PUBLIC_APPROVAL_COMMAND_PREVIEW_MAX_LINES])
+    encoded = preview.encode("utf-8")
+    if len(encoded) > _PUBLIC_APPROVAL_COMMAND_PREVIEW_MAX_BYTES:
+        # Decode an aligned prefix so the public event never contains a broken
+        # UTF-8 code point or concealed overflow bytes.
+        preview = encoded[:_PUBLIC_APPROVAL_COMMAND_PREVIEW_MAX_BYTES].decode("utf-8", errors="ignore")
+        truncated = True
+    return (preview or None), truncated
+
+
+def _public_approval_request(approval_data: Any) -> Optional[dict[str, Any]]:
+    """Project a pending approval to the strict public Runs contract.
+
+    Raw approval metadata is intentionally never used as browser copy, except
+    the exact pending command may appear as a forced-redacted, control-safe,
+    strictly bounded ``commandPreview``. Static strings still pass through the
+    sanitizer so this boundary remains robust if constants are later localized.
+    """
+    approval_id = approval_data.get("approval_id") if isinstance(approval_data, dict) else None
+    if not isinstance(approval_id, str) or not _PUBLIC_APPROVAL_ID_RE.fullmatch(approval_id):
+        return None
+    public = {
+        "approvalId": approval_id,
+        "action": _PUBLIC_APPROVAL_ACTION,
+        "summary": _public_approval_text(_PUBLIC_APPROVAL_SUMMARY, _PUBLIC_APPROVAL_SUMMARY),
+        "purpose": _public_approval_text(_PUBLIC_APPROVAL_PURPOSE, _PUBLIC_APPROVAL_PURPOSE),
+        "riskCode": _PUBLIC_APPROVAL_RISK_CODE,
+        "choices": _approval_event_choices(smart_denied=False, allow_permanent=False),
+    }
+    preview, truncated = _public_approval_command_preview(approval_data)
+    if preview is not None:
+        public["commandPreview"] = preview
+        if truncated:
+            public["commandTruncated"] = True
+    return public
+
+
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
     return {
@@ -1077,14 +1232,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Active run streams: run_id -> bounded fan-out log (legacy tests may
+        # still install a raw asyncio.Queue to exercise callback projection).
+        self._run_streams: Dict[str, Any] = {}
         # Retained after stream cleanup so late callbacks cannot reopen a run.
         self._run_emitters: Dict[str, _RunEventEmitter] = {}
-        # Creation timestamps for orphaned-run TTL sweep
+        # Start timestamps until terminal close, then terminal-close timestamps
+        # for bounded completed-stream replay retention.
         self._run_streams_created: Dict[str, float] = {}
-        # Runs with a connected SSE consumer; their queue is actively draining.
-        self._run_stream_subscribers: set[str] = set()
+        # Connection tokens; a single disconnect must not hide another reader.
+        self._run_stream_subscribers: set[Any] = set()
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -1096,6 +1253,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Opaque IDs currently pending for each run. The manager separately
+        # verifies the same ID against its queue before it can settle a wait.
+        self._run_approval_ids: Dict[str, set[str]] = {}
         # Clarification IDs currently owned by each run. Clients can resolve
         # only an ID emitted by that exact run, even if runs share a session.
         self._run_clarification_ids: Dict[str, set[str]] = {}
@@ -1537,6 +1697,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        event_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1655,6 +1816,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            event_callback=event_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -4557,8 +4719,10 @@ class APIServerAdapter(BasePlatformAdapter):
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
 
-    _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
+    _RUN_STREAM_TTL = 300  # seconds to retain a completed stream for replay
+    _RUN_EVENT_RETENTION = 512  # bounded public events retained per run
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_SSE_WRITE_TIMEOUT = 15  # stalled clients cannot pin an SSE handler
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -4602,8 +4766,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _close_run_event_emitter(self, run_id: str, *, signal: bool = True) -> None:
         emitter = self._run_event_emitter(run_id)
-        if emitter is not None:
-            emitter.close(signal=signal)
+        if emitter is None:
+            return
+        if emitter.close(signal=signal) and signal:
+            # A stream may run longer than its replay TTL. Retention for a
+            # terminal stream starts when its emitter closes, not when the run
+            # started. Subscriber disconnects never close this emitter.
+            self._run_streams_created[run_id] = time.time()
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return the non-lifecycle progress callback for a Runs SSE queue."""
@@ -5165,12 +5334,13 @@ class APIServerAdapter(BasePlatformAdapter):
             instructions = f"{str(instructions or '').strip()}\n\n{artifact_instruction}".strip()
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        stream = _RunEventBuffer(loop, max_events=self._RUN_EVENT_RETENTION)
         created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_emitters[run_id] = _RunEventEmitter(loop, q)
+        self._run_streams[run_id] = stream
+        self._run_emitters[run_id] = _RunEventEmitter(loop, stream)
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        self._run_approval_ids[run_id] = set()
         self._run_clarification_ids[run_id] = set()
 
         # Legacy progress remains only for non-lifecycle liveness updates;
@@ -5179,11 +5349,14 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_cb, tool_complete_cb = self._make_run_tool_callbacks(run_id, loop)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
-            """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+            """Emit only while this run still owns live transport state."""
+            if event is not None and self._run_streams.get(run_id) is stream:
+                self._emit_run_event(run_id, event, loop)
 
-        # Also wire stream_delta_callback so message.delta events flow through.
+        # Authenticated Runs replay intentionally retains bounded answer content
+        # for 300s so ANTON can reconstruct an assistant answer after restart.
+        # This is not a browser trace: tool args/results and provider errors
+        # remain excluded by their dedicated public projections.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
@@ -5195,9 +5368,8 @@ class APIServerAdapter(BasePlatformAdapter):
             }, loop)
 
         def _interim_assistant_cb(text: Any, *, already_streamed: bool = False) -> None:
-            # Deltas remain private to the BFF history path. Therefore Runs
-            # deliberately ignores the platform-rendering dedupe flag and emits
-            # only explicitly public interim prose as a separate trace event.
+            # The dedupe flag belongs to platform rendering, not authenticated
+            # Runs answer replay; safe interim prose is retained separately.
             del already_streamed
             commentary = self._public_assistant_commentary(text)
             if commentary is None:
@@ -5208,6 +5380,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "timestamp": time.time(),
                 "text": commentary,
             }, loop)
+
+        def _agent_event_cb(name: str, payload: Dict[str, Any]) -> None:
+            if name == "provider:recovered":
+                self._emit_run_event(run_id, {
+                    "event": "provider.recovered", "run_id": run_id, "timestamp": time.time(),
+                }, loop)
+                return
+            if name != "provider:retry" or not isinstance(payload, dict):
+                return
+            attempt = payload.get("attempt")
+            max_attempts = payload.get("max_attempts")
+            delay_seconds = payload.get("delay_seconds")
+            reason = payload.get("reason")
+            if (
+                isinstance(attempt, int) and not isinstance(attempt, bool) and 1 <= attempt <= 100
+                and isinstance(max_attempts, int) and not isinstance(max_attempts, bool) and attempt <= max_attempts <= 100
+                and isinstance(delay_seconds, (int, float)) and not isinstance(delay_seconds, bool)
+                and math.isfinite(float(delay_seconds)) and 0 < float(delay_seconds) <= 600
+                and reason in {"rate_limit", "provider_error", "invalid_response"}
+            ):
+                self._emit_run_event(run_id, {
+                    "event": "provider.retry", "run_id": run_id, "timestamp": time.time(),
+                    "attempt": attempt, "max_attempts": max_attempts,
+                    "delay_seconds": round(float(delay_seconds), 1), "reason": reason,
+                }, loop)
 
         self._set_run_status(
             run_id,
@@ -5243,6 +5440,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     tool_start_callback=tool_start_cb,
                     tool_complete_callback=tool_complete_cb,
+                    event_callback=_agent_event_cb,
                     gateway_session_key=gateway_session_key,
                     route=route,
                 )
@@ -5250,22 +5448,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     # The Runs API is a browser/control-plane contract, not a
-                    # privileged terminal transcript. Never emit a command,
-                    # pattern key, or tool arguments here: a client needs the
-                    # risk explanation and a bounded scope, not raw execution
-                    # details it could replay or leak.
+                    # privileged terminal transcript. Emit only its allowlisted
+                    # fields plus the exact command's forced-redacted, bounded
+                    # preview—never pattern keys, arguments, descriptions, or
+                    # other raw execution metadata.
+                    public = _public_approval_request(approval_data)
+                    if public is None:
+                        # The waiter will fail closed on timeout rather than
+                        # exposing an invalid/non-public approval request.
+                        logger.warning("[api_server] rejected invalid public approval for run %s", run_id)
+                        return
+                    self._run_approval_ids.setdefault(run_id, set()).add(public["approvalId"])
                     event = {
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "action": "terminal.command",
-                        "description": _redact_api_error_text(
-                            (approval_data or {}).get("description") or "Potentially dangerous command"
-                        )[:500],
-                        "choices": _approval_event_choices(
-                            smart_denied=bool((approval_data or {}).get("smart_denied")),
-                            allow_permanent=(approval_data or {}).get("allow_permanent") is not False,
-                        ),
+                        **public,
                     }
                     self._set_run_status(
                         run_id,
@@ -5390,7 +5588,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": error_msg,
                     })
                     self._set_run_status(
                         run_id,
@@ -5432,6 +5629,28 @@ class APIServerAdapter(BasePlatformAdapter):
                         artifacts=artifacts,
                         last_event="run.completed",
                     )
+                    # The answer is complete now. Release stop/agent handles before
+                    # optional title work so an unavailable auxiliary provider cannot
+                    # make a completed run look active or stoppable.
+                    self._active_run_agents.pop(run_id, None)
+                    self._active_run_tasks.pop(run_id, None)
+                    # Title generation is deliberately post-completion: the answer
+                    # is already durable/visible and auxiliary failure is harmless.
+                    if not any(item.get("role") == "user" for item in conversation_history) and final_response:
+                        try:
+                            from agent.title_generator import generate_title
+                            title = await asyncio.wait_for(
+                                asyncio.to_thread(generate_title, user_message, final_response),
+                                timeout=8.0,
+                            )
+                            if isinstance(title, str) and title.strip():
+                                safe_title = " ".join(title.split())[:80]
+                                self._emit_run_event(run_id, {
+                                    "event": "conversation.title", "run_id": run_id,
+                                    "timestamp": time.time(), "title": safe_title,
+                                }, loop)
+                        except Exception:
+                            logger.debug("Runs title generation failed", exc_info=True)
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -5456,7 +5675,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "error": _redact_api_error_text(exc),
                 })
             finally:
                 # If the asyncio wrapper is cancelled (for example via
@@ -5476,6 +5694,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_ids.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
                 for clarification_id in self._run_clarification_ids.pop(run_id, set()):
                     try:
@@ -5520,14 +5739,13 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """GET /v1/runs/{run_id}/events — replay and fan out public lifecycle events."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         run_id = request.match_info["run_id"]
-
-        # Allow subscribing slightly before the run is registered (race condition window)
+        # Allow subscribing slightly before the run is registered (race condition window).
         for _ in range(20):
             if run_id in self._run_streams:
                 break
@@ -5535,9 +5753,9 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
-
+        stream = self._run_streams[run_id]
+        subscriber = (run_id, object())
+        self._run_stream_subscribers.add(subscriber)
         response = web.StreamResponse(
             status=200,
             headers={
@@ -5548,25 +5766,42 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         await response.prepare(request)
 
+        async def _write(payload: bytes) -> None:
+            # A peer can keep TCP open while never reading. Bound each write so
+            # its request coroutine (and local stream reference) cannot outlive
+            # terminal replay retention indefinitely.
+            await asyncio.wait_for(response.write(payload), timeout=self._RUN_SSE_WRITE_TIMEOUT)
+
         try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
-                    continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
-                    await response.write(b": stream closed\n\n")
-                    break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
+            if isinstance(stream, _RunEventBuffer):
+                seq = 0
+                while True:
+                    for event in stream.events_after(seq):
+                        seq = int(event["seq"])
+                        await _write(f"data: {json.dumps(event)}\n\n".encode())
+                    if stream.closed:
+                        await _write(b": stream closed\n\n")
+                        break
+                    try:
+                        await stream.wait_for_update(seq, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        await _write(b": keepalive\n\n")
+            else:
+                # Compatibility for tests that manually install a queue.
+                while True:
+                    try:
+                        event = await asyncio.wait_for(stream.get(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        await _write(b": keepalive\n\n")
+                        continue
+                    if event is None:
+                        await _write(b": stream closed\n\n")
+                        break
+                    await _write(f"data: {json.dumps(event)}\n\n".encode())
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            self._run_stream_subscribers.discard(subscriber)
 
         return response
 
@@ -5590,14 +5825,18 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        approval_id = body.get("approvalId")
+        if not isinstance(approval_id, str) or not _PUBLIC_APPROVAL_ID_RE.fullmatch(approval_id):
+            return web.json_response(
+                _openai_error("Missing or invalid approvalId", code="invalid_approval_id"), status=400
+            )
         raw_choice = str(body.get("choice", "")).strip().lower()
-        aliases = {"approve": "once", "approved": "once", "allow": "once"}
-        choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
+        choice = raw_choice
+        allowed = {"once", "session", "deny"}
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    "Invalid approval choice; expected one of: once, session, deny",
                     code="invalid_approval_choice",
                 ),
                 status=400,
@@ -5612,37 +5851,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=409,
             )
-
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
-        )
-        try:
-            from tools.approval import resolve_gateway_approval
-
-            resolved = resolve_gateway_approval(
-                approval_session_key,
-                choice,
-                resolve_all=resolve_all,
+        if approval_id not in self._run_approval_ids.get(run_id, set()):
+            return web.json_response(
+                _openai_error("Approval is not pending for this run", code="approval_not_pending"),
+                status=409,
             )
+
+        try:
+            from tools.approval import resolve_gateway_approval_id
+
+            resolved = resolve_gateway_approval_id(approval_session_key, approval_id, choice)
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
+            # An expiry/cancel/racing terminal response removed the manager
+            # entry. Drop the stale API binding and fail closed.
+            self._run_approval_ids.get(run_id, set()).discard(approval_id)
             return web.json_response(
-                _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
-                ),
+                _openai_error("Approval is no longer pending", code="approval_not_pending"),
                 status=409,
             )
+        self._run_approval_ids.get(run_id, set()).discard(approval_id)
 
         self._set_run_status(run_id, "running", last_event="approval.responded")
         self._emit_run_event(run_id, {
             "event": "approval.responded",
             "run_id": run_id,
             "timestamp": time.time(),
+            "approvalId": approval_id,
             "choice": choice,
             "resolved": resolved,
         })
@@ -5650,6 +5888,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "approvalId": approval_id,
             "choice": choice,
             "resolved": resolved,
         })
@@ -5745,11 +5984,28 @@ class APIServerAdapter(BasePlatformAdapter):
         """Expire old SSE buffers without treating transport age as run age."""
         if now is None:
             now = time.time()
+        def _has_subscriber(run_id: str) -> bool:
+            return any(
+                subscriber == run_id
+                or (isinstance(subscriber, tuple) and subscriber and subscriber[0] == run_id)
+                for subscriber in self._run_stream_subscribers
+            )
+
+        def _terminal_stream(run_id: str) -> bool:
+            stream = self._run_streams.get(run_id)
+            if isinstance(stream, _RunEventBuffer) and stream.closed:
+                return True
+            return self._run_statuses.get(run_id, {}).get("status") in {"completed", "failed", "cancelled"}
+
         stale = [
             run_id
             for run_id, created_at in list(self._run_streams_created.items())
             if now - created_at > self._RUN_STREAM_TTL
-            and run_id not in self._run_stream_subscribers
+            # Active runs retain their bounded replay log across client/gateway
+            # reconnects. A terminal stream hard-expires even with a stalled
+            # subscriber; write timeouts and token cleanup bound that handler.
+            and (not _has_subscriber(run_id) or _terminal_stream(run_id))
+            and (self._active_run_tasks.get(run_id) is None or self._active_run_tasks[run_id].done())
         ]
         for run_id in stale:
             logger.debug("[api_server] sweeping expired run transport %s", run_id)
@@ -5768,11 +6024,19 @@ class APIServerAdapter(BasePlatformAdapter):
             # independent and survives until the executor-backed task returns.
             self._close_run_event_emitter(run_id, signal=False)
             self._run_streams.pop(run_id, None)
+            self._run_emitters.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            self._run_stream_subscribers = {
+                subscriber
+                for subscriber in self._run_stream_subscribers
+                if subscriber != run_id
+                and not (isinstance(subscriber, tuple) and subscriber and subscriber[0] == run_id)
+            }
             if task_done:
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_ids.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
                 clarification_ids = self._run_clarification_ids.pop(run_id, set())
                 if clarification_ids:
