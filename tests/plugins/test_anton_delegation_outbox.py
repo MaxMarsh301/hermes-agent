@@ -85,8 +85,60 @@ def test_migration_is_additive_idempotent_and_never_reinterprets_cron_json(tmp_p
         assert conn.execute("SELECT payload_json FROM cron_delivery_outbox").fetchone() == ('{"deliveryId":"cron-id"}',)
 
 
+def test_outbox_pins_existing_key_across_rotation_and_legacy_or_missing_generation_fails_closed(monkeypatch, tmp_path):
+    outbox_module, _, config_module, platform = _modules()
+    body, digest = _body(), hashlib.sha256(_body()).hexdigest()
+    outbox = outbox_module.DelegationOutbox(tmp_path / "state.db")
+    assert outbox.create_or_confirm(DELIVERY_ID, {"route": "anton"}, body, digest, "key-A")["signingKeyId"] == "key-A"
+    # Re-ingesting immutable bytes after rotation confirms A, rather than B.
+    assert outbox.create_or_confirm(DELIVERY_ID, {"route": "anton"}, body, digest, "key-B")["signingKeyId"] == "key-A"
+    with pytest.raises(outbox_module.DelegationOutboxIntegrityError):
+        outbox.create_or_confirm(DELIVERY_ID, {"route": "anton"}, _body("other"), hashlib.sha256(_body("other")).hexdigest(), "key-B")
+    _delegation_env(monkeypatch)
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_CURRENT_KEY_ID", "key-B")
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_CURRENT_SECRET", "secret-B")
+    # Retired/empty generations are filtered before ownership or attempts.
+    assert outbox.due(signing_key_ids=["key-B"]) == []
+    protected = outbox.get(DELIVERY_ID)
+    assert protected["state"] == "pending" and protected["attempts"] == 0
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_PREVIOUS_KEY_ID", "key-A")
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_PREVIOUS_SECRET", "secret-A")
+    captured = []
+    class Client:
+        def __init__(self, config): self.config = config
+        async def deliver_delegation(self, body, delivery_id, *, key_id=None): captured.append(key_id); return {"outcome": "queued"}
+    monkeypatch.setattr(platform, "AntonGatewayClient", Client)
+    record = outbox.due()[0]
+    assert asyncio.run(platform._send_delegation_record(record)) == {"outcome": "queued"} and captured == ["key-A"]
+    record["signingKeyId"] = "retired"
+    with pytest.raises(Exception) as error:
+        asyncio.run(platform._send_delegation_record(record))
+    assert getattr(error.value, "code", None) == "missing_signing_key_generation"
+    # Additive migration exposes empty legacy key values and sender refuses them.
+    legacy = tmp_path / "legacy.db"
+    with sqlite3.connect(legacy) as conn:
+        conn.execute("CREATE TABLE anton_delegation_outbox (delivery_id TEXT PRIMARY KEY, route_json TEXT NOT NULL, body BLOB NOT NULL, body_sha256 TEXT NOT NULL, state TEXT NOT NULL, lease_token TEXT, lease_version INTEGER NOT NULL DEFAULT 0, lease_expires_at REAL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL, error_code TEXT, error_status INTEGER, ack_json TEXT, outcome TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL, delivered_at REAL)")
+        conn.execute("INSERT INTO anton_delegation_outbox VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("legacy", "{}", body, digest, "pending", None, 0, None, 0, 0.0, None, None, None, None, 0.0, 0.0, None))
+    migrated = outbox_module.DelegationOutbox(legacy)
+    with sqlite3.connect(legacy) as conn:
+        assert "signing_key_id" in {row[1] for row in conn.execute("PRAGMA table_info(anton_delegation_outbox)")}
+    with pytest.raises(Exception) as error:
+        asyncio.run(platform._send_delegation_record(migrated.due()[0]))
+    assert getattr(error.value, "code", None) == "missing_signing_key_generation"
+
+
+def test_delegation_config_rejects_duplicate_current_and_previous_key_ids(monkeypatch):
+    _, _, config_module, _ = _modules()
+    _delegation_env(monkeypatch)
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_PREVIOUS_KEY_ID", "deleg-current")
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_PREVIOUS_SECRET", "old")
+    with pytest.raises(ValueError):
+        config_module.AntonConfig.delegation_from_env()
+
+
 def test_ingest_orders_create_before_ack_and_releases_exact_claim_on_failures(monkeypatch, tmp_path):
-    outbox_module, *_ = _modules()
+    outbox_module, _, config_module, _ = _modules()
+    _delegation_env(monkeypatch)
     body, digest = _body(), hashlib.sha256(_body()).hexdigest()
     handoff = {"delegation_id": "deleg_test", "delivery_id": DELIVERY_ID, "route": {"route": "anton"},
                "body_json": body.decode(), "body_sha256": digest, "claim_token": "token", "claim_version": 7}
@@ -345,11 +397,12 @@ async def test_purpose_separation_readiness_and_sender_need_no_cron_keys(monkeyp
     captured = []
     class Client:
         def __init__(self, config): captured.append(config)
-        async def deliver_delegation(self, body, delivery_id):
+        async def deliver_delegation(self, body, delivery_id, *, key_id=None):
             assert body == _body() and delivery_id == DELIVERY_ID
+            assert key_id == "deleg-current"
             return {"outcome": "queued"}
     monkeypatch.setattr(platform, "AntonGatewayClient", Client)
-    assert await platform._send_delegation_record({"body": _body(), "bodySha256": hashlib.sha256(_body()).hexdigest(), "deliveryId": DELIVERY_ID}) == {"outcome": "queued"}
+    assert await platform._send_delegation_record({"body": _body(), "bodySha256": hashlib.sha256(_body()).hexdigest(), "deliveryId": DELIVERY_ID, "signingKeyId": "deleg-current"}) == {"outcome": "queued"}
     assert captured[0].delegation_delivery_key == "deleg-secret"
 
 
@@ -399,10 +452,12 @@ async def test_retry_delegation_claims_one_record_immediately_before_each_send(m
     class Outbox:
         def ingest_handoffs(self, *, limit):
             events.append(("ingest", limit)); return 0
-        def due(self, *, limit):
+        def due(self, *, limit, signing_key_ids):
+            assert signing_key_ids == ["deleg-current"]
             events.append(("due", limit)); return [records.pop(0)] if records else []
         def delivered(self, delivery_id, *_args):
             events.append(("settle", delivery_id)); return True
+    _delegation_env(monkeypatch)
     monkeypatch.setattr(platform, "detached_completion_sink_ready", lambda: True)
     monkeypatch.setattr(platform, "_send_delegation_record", lambda record: events.append(("send", record["deliveryId"])) or asyncio.sleep(0, result={"outcome": "queued"}))
     monkeypatch.setattr(outbox_module, "DelegationOutbox", Outbox)

@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 import sys
 import types
@@ -935,6 +936,8 @@ def _anton_v2_headers(context: dict, body: bytes, *, key_id="origin-current", se
     }
     if content_type is not None:
         headers["Content-Type"] = content_type
+    if context.get("mode") == "synthesize_only":
+        headers["Idempotency-Key"] = "anton-continuation:delivery_0123456789abcdef0123456789abcdef"
     return headers
 
 
@@ -998,7 +1001,7 @@ class TestAntonOriginV2Runs:
         monkeypatch.setenv("ANTON_RUN_ORIGIN_V2_CURRENT_SECRET", "origin-secret")
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("ready", "expected_async"), [(True, True), (False, False)])
+    @pytest.mark.parametrize(("ready", "expected_async"), [(True, False), (False, False)])
     async def test_parent_mode_binds_generated_run_and_only_enables_async_when_ready(self, adapter, monkeypatch, tmp_path, ready, expected_async):
         self._enable_v2(monkeypatch, tmp_path)
         origin_context = _install_fake_anton_v2_context(monkeypatch)
@@ -1607,6 +1610,92 @@ class TestAntonOriginV2Runs:
         read_body.assert_not_awaited()
         parse_json.assert_not_called()
         create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_delivery_idempotency_is_exact_deterministic_and_does_not_touch_ordinary_runs(self, adapter, monkeypatch, tmp_path):
+        self._enable_v2(monkeypatch, tmp_path)
+        _install_fake_anton_v2_context(monkeypatch)
+        session_id = "anton-chat-0123456789abcdef0123456789abcdef"
+        context = {"origin": "anton", "originConversationId": "conversation_0123456789abcdef0123456789abcdef", "hermesSessionId": session_id, "protocol": "anton.delegation.v1", "mode": "synthesize_only"}
+        def body(summary="safe"):
+            return json.dumps({"input": "continue", "session_id": session_id, "conversation_history": [], "attachments": [], "antonContinuation": _anton_continuation(summary)}, sort_keys=True, separators=(",", ":")).encode()
+        created = []
+        def agent_factory(**_):
+            agent = MagicMock(); agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+            agent.run_conversation.return_value = {"final_response": "safe"}; created.append(agent); return agent
+        first_body, app = body(), _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=agent_factory):
+                first, duplicate = await asyncio.gather(
+                    cli.post("/v1/runs", data=first_body, headers=_anton_v2_headers(context, first_body)),
+                    cli.post("/v1/runs", data=first_body, headers=_anton_v2_headers(context, first_body)),
+                )
+                expected = "run_" + hashlib.sha256(b"hermes.api.runs.anton.synthesize-only.run-id.v1\x00delivery_0123456789abcdef0123456789abcdef").hexdigest()[:32]
+                assert first.status == duplicate.status == 202
+                assert (await first.json())["run_id"] == (await duplicate.json())["run_id"] == expected
+                assert len(created) == 1
+                changed = body("changed")
+                assert (await cli.post("/v1/runs", data=changed, headers=_anton_v2_headers(context, changed))).status == 409
+                missing = _anton_v2_headers(context, first_body); missing.pop("Idempotency-Key")
+                assert (await cli.post("/v1/runs", data=first_body, headers=missing)).status == 400
+                wrong = _anton_v2_headers(context, first_body); wrong["Idempotency-Key"] = "anton-continuation:wrong"
+                assert (await cli.post("/v1/runs", data=first_body, headers=wrong)).status == 400
+        recreated = _make_adapter()
+        async with TestClient(TestServer(_create_app(recreated))) as cli:
+            with patch.object(recreated, "_create_agent", side_effect=agent_factory):
+                replay = await cli.post("/v1/runs", data=first_body, headers=_anton_v2_headers(context, first_body))
+                assert (await replay.json())["run_id"] == expected
+                ordinary_context = dict(context, mode="parent_continuation")
+                ordinary_body = json.dumps({"input": "ordinary", "session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+                ordinary = await cli.post("/v1/runs", data=ordinary_body, headers=_anton_v2_headers(ordinary_context, ordinary_body))
+                assert re.fullmatch(r"run_[0-9a-f]{32}", (await ordinary.json())["run_id"])
+
+
+class TestDurableAntonSynthesisIdempotency:
+    def test_two_response_store_connections_fence_reclaim_and_terminal_replay(self, tmp_path):
+        path = str(tmp_path / "response_store.db")
+        first, second = ResponseStore(db_path=path), ResponseStore(db_path=path)
+        key, fingerprint, run_id = "anton-continuation:delivery", "fingerprint-a", "run_durable"
+        assert first.claim_anton_synthesis(key, fingerprint, run_id, "owner-a", lease_seconds=15)["decision"] == "owner"
+        assert second.claim_anton_synthesis(key, fingerprint, run_id, "owner-b", lease_seconds=15) == {"decision": "live", "run_id": run_id}
+        assert second.claim_anton_synthesis(key, "fingerprint-b", run_id, "owner-b", lease_seconds=15)["decision"] == "conflict"
+        # Simulate an interrupted owner. Reclaim retains the deterministic ID.
+        second._conn.execute("UPDATE anton_synthesize_idempotency SET lease_expires_at=0 WHERE idempotency_key=?", (key,))
+        second._conn.commit()
+        assert second.claim_anton_synthesis(key, fingerprint, run_id, "owner-b", lease_seconds=15)["decision"] == "owner"
+        safe = {"object": "hermes.run", "run_id": run_id, "status": "completed", "output": "safe", "updated_at": 1.0}
+        assert second.finish_anton_synthesis(key, "owner-b", safe)
+        recreated = ResponseStore(db_path=path)
+        replay = recreated.claim_anton_synthesis(key, fingerprint, run_id, "owner-c", lease_seconds=15)
+        assert replay == {"decision": "terminal", "run_id": run_id, "status": safe}
+        assert recreated.get_anton_synthesis_status(run_id) == safe
+        first.close(); second.close(); recreated.close()
+
+
+class TestApiOwnedDelegationRecovery:
+    @pytest.mark.asyncio
+    async def test_recovery_starts_only_for_live_site_and_disconnect_cancels_owned_task(self, monkeypatch):
+        adapter = _make_adapter(api_key="a" * 16)
+        adapter._port = 0
+        called = asyncio.Event()
+        platform_module = types.ModuleType("hermes_plugins.anton_gateway.platform")
+        async def retry_delegation_due(*, limit):
+            assert limit == 10
+            called.set()
+            return 0
+        platform_module.retry_delegation_due = retry_delegation_due
+        plugins_module = types.ModuleType("hermes_plugins"); plugins_module.__path__ = []
+        anton_module = types.ModuleType("hermes_plugins.anton_gateway"); anton_module.__path__ = []
+        monkeypatch.setitem(sys.modules, "hermes_plugins", plugins_module)
+        monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway", anton_module)
+        monkeypatch.setitem(sys.modules, "hermes_plugins.anton_gateway.platform", platform_module)
+        monkeypatch.setattr("gateway.platforms.api_server._anton_detached_completion_sink_ready", lambda: True)
+        assert await adapter.connect()
+        task = adapter._detached_delivery_task
+        assert task is not None and not task.done()
+        await asyncio.wait_for(called.wait(), timeout=1)
+        await adapter.disconnect()
+        assert adapter._detached_delivery_task is None and task.cancelled()
 
 
 # ---------------------------------------------------------------------------

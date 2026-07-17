@@ -49,6 +49,7 @@ class DelegationOutbox:
                 route_json TEXT NOT NULL,
                 body BLOB NOT NULL,
                 body_sha256 TEXT NOT NULL,
+                signing_key_id TEXT NOT NULL DEFAULT '',
                 state TEXT NOT NULL CHECK(state IN ('pending','claimed','delivered','dead_letter')),
                 lease_token TEXT, lease_version INTEGER NOT NULL DEFAULT 0,
                 lease_expires_at REAL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -56,6 +57,11 @@ class DelegationOutbox:
                 ack_json TEXT, outcome TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
                 delivered_at REAL
             )""")
+            # Additive migration for databases created before key generations
+            # were pinned. Empty legacy values deliberately fail closed on send.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(anton_delegation_outbox)")}
+            if "signing_key_id" not in columns:
+                conn.execute("ALTER TABLE anton_delegation_outbox ADD COLUMN signing_key_id TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_anton_delegation_outbox_due ON anton_delegation_outbox(state, next_attempt_at) WHERE state='pending'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_anton_delegation_outbox_lease ON anton_delegation_outbox(state, lease_expires_at) WHERE state='claimed'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_anton_delegation_outbox_retention ON anton_delegation_outbox(state, delivered_at) WHERE state IN ('delivered','dead_letter')")
@@ -68,33 +74,49 @@ class DelegationOutbox:
     def _row(row):
         if row is None:
             return None
-        keys = ("deliveryId","routeJson","body","bodySha256","state","leaseToken","leaseVersion","leaseExpiresAt","attempts","nextAttemptAt","errorCode","errorStatus","ackJson","outcome","createdAt","updatedAt","deliveredAt")
+        keys = ("deliveryId","routeJson","body","bodySha256","signingKeyId","state","leaseToken","leaseVersion","leaseExpiresAt","attempts","nextAttemptAt","errorCode","errorStatus","ackJson","outcome","createdAt","updatedAt","deliveredAt")
         return dict(zip(keys, row))
 
-    def create_or_confirm(self, delivery_id: str, route: Any, body: bytes | str, body_sha256: str) -> dict:
+    def create_or_confirm(self, delivery_id: str, route: Any, body: bytes | str, body_sha256: str, signing_key_id: str = "") -> dict:
         if isinstance(body, str): body = body.encode("utf-8")
         if not isinstance(body, bytes) or len(body) > 65536 or hashlib.sha256(body).hexdigest() != body_sha256:
             raise DelegationOutboxIntegrityError("invalid immutable delegation record")
         route_json, now = self._route(route), float(self.clock())
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT route_json, body, body_sha256 FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            row = conn.execute("SELECT route_json, body, body_sha256, signing_key_id FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
             if row is None:
-                conn.execute("INSERT INTO anton_delegation_outbox (delivery_id,route_json,body,body_sha256,state,next_attempt_at,created_at,updated_at) VALUES (?,?,?,?, 'pending',?,?,?)", (delivery_id, route_json, body, body_sha256, now, now, now))
-            elif row != (route_json, body, body_sha256):
+                conn.execute("INSERT INTO anton_delegation_outbox (delivery_id,route_json,body,body_sha256,signing_key_id,state,next_attempt_at,created_at,updated_at) VALUES (?,?,?,?,?, 'pending',?,?,?)", (delivery_id, route_json, body, body_sha256, signing_key_id, now, now, now))
+            # The signing generation is immutable once selected.  A retry
+            # after rotation confirms the prior saved generation instead of
+            # conflicting or silently changing the signature identity.
+            elif row[:3] != (route_json, body, body_sha256):
                 conn.rollback()
                 raise DelegationOutboxIntegrityError("immutable delegation delivery conflict")
-            saved = conn.execute("SELECT delivery_id,route_json,body,body_sha256,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            saved = conn.execute("SELECT delivery_id,route_json,body,body_sha256,signing_key_id,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
             return self._row(saved)
 
-    def due(self, limit: int = 10, lease_seconds: float = MIN_LEASE_SECONDS) -> list[dict]:
+    def due(self, limit: int = 10, lease_seconds: float = MIN_LEASE_SECONDS, *, signing_key_ids=None) -> list[dict]:
         try: limit = min(max(0, int(limit)), self.MAX_CLAIM_LIMIT)
         except (TypeError, ValueError): return []
         if not limit: return []
+        # Callback key readiness is a pre-claim boundary.  In particular, a
+        # retired/legacy generation must remain pending without consuming an
+        # attempt or being dead-lettered merely because it cannot be signed.
+        key_ids = None
+        if signing_key_ids is not None:
+            key_ids = tuple(sorted({key_id for key_id in signing_key_ids if isinstance(key_id, str) and key_id}))
+            if not key_ids:
+                return []
         now, lease_seconds = float(self.clock()), max(float(lease_seconds), self.MIN_LEASE_SECONDS)
         result = []
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            key_filter = ""
+            key_params: tuple = ()
+            if key_ids is not None:
+                key_filter = " AND signing_key_id IN (" + ",".join("?" for _ in key_ids) + ")"
+                key_params = key_ids
             # Consume exhausted due work before selecting ownership.  This fences
             # a crashed twentieth sender: once its lease expires it cannot cause
             # a twenty-first HTTP attempt.
@@ -102,19 +124,19 @@ class DelegationOutbox:
                 "UPDATE anton_delegation_outbox SET state='dead_letter', lease_token=NULL, "
                 "lease_expires_at=NULL, error_code='attempts_exhausted', updated_at=? "
                 "WHERE attempts>=? AND ((state='pending' AND next_attempt_at<=?) "
-                "OR (state='claimed' AND lease_expires_at<=?))",
-                (now, self.MAX_ATTEMPTS, now, now),
+                "OR (state='claimed' AND lease_expires_at<=?))" + key_filter,
+                (now, self.MAX_ATTEMPTS, now, now) + key_params,
             )
             rows = conn.execute(
                 "SELECT delivery_id FROM anton_delegation_outbox WHERE attempts<? AND "
                 "((state='pending' AND next_attempt_at<=?) OR (state='claimed' AND lease_expires_at<=?)) "
-                "ORDER BY next_attempt_at, created_at LIMIT ?",
-                (self.MAX_ATTEMPTS, now, now, limit),
+                + key_filter + " ORDER BY next_attempt_at, created_at LIMIT ?",
+                (self.MAX_ATTEMPTS, now, now) + key_params + (limit,),
             ).fetchall()
             for (delivery_id,) in rows:
                 token = uuid.uuid4().hex
                 conn.execute("UPDATE anton_delegation_outbox SET state='claimed', lease_token=?, lease_version=lease_version+1, lease_expires_at=?, attempts=attempts+1, updated_at=? WHERE delivery_id=? AND attempts<? AND (state='pending' OR (state='claimed' AND lease_expires_at<=?))", (token, now + lease_seconds, now, delivery_id, self.MAX_ATTEMPTS, now))
-                row = conn.execute("SELECT delivery_id,route_json,body,body_sha256,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+                row = conn.execute("SELECT delivery_id,route_json,body,body_sha256,signing_key_id,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
                 result.append(self._row(row))
         return result
 
@@ -147,7 +169,7 @@ class DelegationOutbox:
 
     def get(self, delivery_id: str):
         with self._connect() as conn:
-            return self._row(conn.execute("SELECT delivery_id,route_json,body,body_sha256,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone())
+            return self._row(conn.execute("SELECT delivery_id,route_json,body,body_sha256,signing_key_id,state,lease_token,lease_version,lease_expires_at,attempts,next_attempt_at,error_code,error_status,ack_json,outcome,created_at,updated_at,delivered_at FROM anton_delegation_outbox WHERE delivery_id=?", (delivery_id,)).fetchone())
 
     def ingest_handoffs(self, limit: int = 10) -> int:
         """Materialize Slice B handoffs before acknowledging their ledger claim."""
@@ -155,7 +177,9 @@ class DelegationOutbox:
         created = 0
         for handoff in claim_anton_handoffs(limit=limit, lease_seconds=self.MIN_LEASE_SECONDS):
             try:
-                self.create_or_confirm(handoff["delivery_id"], handoff["route"], handoff["body_json"], handoff["body_sha256"])
+                from .config import AntonConfig
+                key_id = AntonConfig.delegation_from_env().delegation_delivery_key_id
+                self.create_or_confirm(handoff["delivery_id"], handoff["route"], handoff["body_json"], handoff["body_sha256"], key_id)
                 if not mark_anton_handoff_completed(handoff["delegation_id"], handoff["claim_token"], handoff["claim_version"]):
                     raise RuntimeError("ledger acknowledgement lost")
                 created += 1

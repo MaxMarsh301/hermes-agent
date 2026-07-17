@@ -103,6 +103,16 @@ class AntonConfig:
     allow_insecure_http: bool = False
     delegation_delivery_key: str = ""
     delegation_delivery_key_id: str = ""
+    delegation_delivery_previous_key: str = ""
+    delegation_delivery_previous_key_id: str = ""
+
+    def delegation_key_for(self, key_id: str) -> str:
+        """Resolve the immutable outbox signing generation, never a fallback."""
+        if key_id == self.delegation_delivery_key_id:
+            return self.delegation_delivery_key
+        if key_id == self.delegation_delivery_previous_key_id:
+            return self.delegation_delivery_previous_key
+        raise ValueError("unknown ANTON delegation delivery key generation")
 
     @classmethod
     def delegation_from_env(cls) -> "AntonConfig":
@@ -121,6 +131,8 @@ class AntonConfig:
             timeout=timeout, enabled=_enabled(), allow_insecure_http=_allow_insecure_http(),
             delegation_delivery_key=os.getenv("ANTON_DELEGATION_DELIVERY_CURRENT_SECRET", ""),
             delegation_delivery_key_id=os.getenv("ANTON_DELEGATION_DELIVERY_CURRENT_KEY_ID", ""),
+            delegation_delivery_previous_key=os.getenv("ANTON_DELEGATION_DELIVERY_PREVIOUS_SECRET", ""),
+            delegation_delivery_previous_key_id=os.getenv("ANTON_DELEGATION_DELIVERY_PREVIOUS_KEY_ID", ""),
         )
         if not config.enabled or not _flag("ANTON_DELEGATION_DELIVERY_ENABLED"):
             raise ValueError("ANTON delegation delivery is disabled")
@@ -131,6 +143,13 @@ class AntonConfig:
         except ValueError as exc:
             raise ValueError("ANTON delegation delivery configuration is incomplete") from exc
         if not config.delegation_delivery_key.strip() or not KEY_ID_RE.fullmatch(config.delegation_delivery_key_id):
+            raise ValueError("ANTON delegation delivery configuration is incomplete")
+        if bool(config.delegation_delivery_previous_key) != bool(config.delegation_delivery_previous_key_id):
+            raise ValueError("ANTON delegation delivery configuration is incomplete")
+        if config.delegation_delivery_previous_key and not KEY_ID_RE.fullmatch(config.delegation_delivery_previous_key_id):
+            raise ValueError("ANTON delegation delivery configuration is incomplete")
+        if (config.delegation_delivery_previous_key_id
+                and config.delegation_delivery_previous_key_id == config.delegation_delivery_key_id):
             raise ValueError("ANTON delegation delivery configuration is incomplete")
         return config
 

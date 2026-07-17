@@ -111,20 +111,23 @@ class AntonGatewayClient:
             headers["X-AG-Resolver-Scope"] = "anton.resolve"
         return headers
 
-    def _delegation_headers(self, body: bytes) -> dict[str, str]:
-        if not self.config.delegation_delivery_key or not self.config.delegation_delivery_key_id:
+    def _delegation_headers(self, body: bytes, key_id: str | None = None) -> dict[str, str]:
+        key_id = key_id or self.config.delegation_delivery_key_id
+        try:
+            key = self.config.delegation_key_for(key_id)
+        except ValueError:
             raise AntonTransportError("disabled")
         timestamp = delegation_timestamp(self._clock())
         nonce = secrets.token_urlsafe(32).rstrip("=")
         digest = hashlib.sha256(body).hexdigest()
-        preimage = f"{DELEGATION_VERSION}\nPOST\n{DELEGATION_PATH}\n{timestamp}\n{nonce}\n{self.config.delegation_delivery_key_id}\n{digest}\n".encode("utf-8")
-        signature = hmac.new(self.config.delegation_delivery_key.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+        preimage = f"{DELEGATION_VERSION}\nPOST\n{DELEGATION_PATH}\n{timestamp}\n{nonce}\n{key_id}\n{digest}\n".encode("utf-8")
+        signature = hmac.new(key.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
         return {"Content-Type": "application/json; charset=utf-8", "X-Anton-Delegation-Version": DELEGATION_VERSION,
-                "X-Anton-Delegation-Key-Id": self.config.delegation_delivery_key_id,
+                "X-Anton-Delegation-Key-Id": key_id,
                 "X-Anton-Delegation-Timestamp": timestamp, "X-Anton-Delegation-Nonce": nonce,
                 "X-Anton-Delegation-Body-SHA256": digest, "X-Anton-Delegation-Signature": signature}
 
-    async def deliver_delegation(self, body: bytes, delivery_id: str) -> dict[str, Any]:
+    async def deliver_delegation(self, body: bytes, delivery_id: str, *, key_id: str | None = None) -> dict[str, Any]:
         """Send stored completion bytes; this is deliberately separate from cron delivery."""
         if not self.config.enabled or not isinstance(body, bytes) or len(body) > MAX_DELEGATION_REQUEST_BYTES:
             raise AntonTransportError("disabled" if not self.config.enabled else "request_too_large")
@@ -132,7 +135,7 @@ class AntonGatewayClient:
         try:
             async with asyncio.timeout(self.config.timeout):
                 async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=self._transport) as client:
-                    async with client.stream("POST", self._base_url + DELEGATION_PATH, headers=self._delegation_headers(body), content=body) as response:
+                    async with client.stream("POST", self._base_url + DELEGATION_PATH, headers=self._delegation_headers(body, key_id), content=body) as response:
                         status, chunks, size = response.status_code, [], 0
                         async for chunk in response.aiter_bytes():
                             size += len(chunk)

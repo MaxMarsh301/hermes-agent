@@ -690,6 +690,25 @@ class ResponseStore:
                 response_id TEXT NOT NULL
             )"""
         )
+        # Public-only terminal recovery for trusted synthesize-only Runs.
+        # SQLite lease ownership, not an adapter-local map, is authoritative.
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS anton_synthesize_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                run_id TEXT NOT NULL UNIQUE,
+                owner_uuid TEXT,
+                lease_expires_at REAL,
+                state TEXT NOT NULL CHECK(state IN ('active','completed','failed','cancelled')),
+                status_json TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_anton_synthesize_idempotency_lease "
+            "ON anton_synthesize_idempotency(state, lease_expires_at)"
+        )
         self._conn.commit()
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
@@ -800,6 +819,73 @@ class ResponseStore:
             (name, response_id),
         )
         self._conn.commit()
+
+    def claim_anton_synthesis(self, idempotency_key: str, fingerprint: str, run_id: str, owner_uuid: str, *, lease_seconds: float) -> Dict[str, Any]:
+        """Atomically claim/recover a trusted synthesis across SQLite connections."""
+        now = time.time()
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT fingerprint,run_id,lease_expires_at,state,status_json FROM anton_synthesize_idempotency WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO anton_synthesize_idempotency (idempotency_key,fingerprint,run_id,owner_uuid,lease_expires_at,state,created_at,updated_at) VALUES (?,?,?,?,?,'active',?,?)",
+                    (idempotency_key, fingerprint, run_id, owner_uuid, now + lease_seconds, now, now),
+                )
+                return {"decision": "owner", "run_id": run_id}
+            saved_fingerprint, saved_run_id, expires_at, state, status_json = row
+            if saved_fingerprint != fingerprint or saved_run_id != run_id:
+                return {"decision": "conflict", "run_id": saved_run_id}
+            if state != "active":
+                try:
+                    status = json.loads(status_json) if status_json else None
+                except (TypeError, json.JSONDecodeError):
+                    status = None
+                return {"decision": "terminal", "run_id": saved_run_id, "status": status}
+            if expires_at is not None and float(expires_at) <= now:
+                self._conn.execute(
+                    "UPDATE anton_synthesize_idempotency SET owner_uuid=?,lease_expires_at=?,updated_at=? WHERE idempotency_key=? AND state='active' AND lease_expires_at<=?",
+                    (owner_uuid, now + lease_seconds, now, idempotency_key, now),
+                )
+                return {"decision": "owner", "run_id": saved_run_id}
+            return {"decision": "live", "run_id": saved_run_id}
+
+    def heartbeat_anton_synthesis(self, idempotency_key: str, owner_uuid: str, *, lease_seconds: float) -> bool:
+        now = time.time()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE anton_synthesize_idempotency SET lease_expires_at=?,updated_at=? WHERE idempotency_key=? AND state='active' AND owner_uuid=?",
+                (now + lease_seconds, now, idempotency_key, owner_uuid),
+            )
+        return cur.rowcount == 1
+
+    def finish_anton_synthesis(self, idempotency_key: str, owner_uuid: str, status: Dict[str, Any]) -> bool:
+        """Persist a safe terminal status before releasing the owner lease."""
+        state = status.get("status")
+        if state not in {"completed", "failed", "cancelled"}:
+            return False
+        now = time.time()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE anton_synthesize_idempotency SET state=?,status_json=?,owner_uuid=NULL,lease_expires_at=NULL,updated_at=? WHERE idempotency_key=? AND state='active' AND owner_uuid=?",
+                (state, json.dumps(status, sort_keys=True, separators=(",", ":"), ensure_ascii=False), now, idempotency_key, owner_uuid),
+            )
+        return cur.rowcount == 1
+
+    def get_anton_synthesis_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT status_json FROM anton_synthesize_idempotency WHERE run_id=? AND state IN ('completed','failed','cancelled')",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            status = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return status if isinstance(status, dict) else None
 
     def close(self) -> None:
         """Close the database connection."""
@@ -1237,6 +1323,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Clarification IDs currently owned by each run. Clients can resolve
         # only an ID emitted by that exact run, even if runs share a session.
         self._run_clarification_ids: Dict[str, set[str]] = {}
+
         # Phase 5: session-owned upload records and per-run output directories.
         # This is not a general filesystem API: only the file store can resolve
         # browser-supplied IDs and only a run's own output directory is exposed.
@@ -1262,6 +1349,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # API Server owns detached delivery recovery when this trusted sink is enabled.
+        self._detached_delivery_task: Optional["asyncio.Task"] = None
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1279,6 +1368,19 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return 0
+
+    async def _detached_delivery_loop(self) -> None:
+        """Bounded ingest-then-drain recovery owned by this API-server process."""
+        while True:
+            try:
+                from hermes_plugins.anton_gateway.platform import retry_delegation_due
+                await retry_delegation_due(limit=10)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never expose signed request/private delivery data in logs.
+                logger.warning("[api_server] detached delegation recovery iteration failed")
+            await asyncio.sleep(5)
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -5035,6 +5137,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _ANTON_SYNTHESIS_LEASE_SECONDS = 15.0
+    _ANTON_SYNTHESIS_HEARTBEAT_SECONDS = 5.0
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -5605,6 +5709,21 @@ class APIServerAdapter(BasePlatformAdapter):
             # file-backed input on a private, side-effect-free continuation.
             return web.json_response(_openai_error("Invalid ANTON continuation"), status=400)
 
+        continuation_idempotency_key: Optional[str] = None
+        if synthesize_only:
+            delivery_id = body["antonContinuation"]["deliveryId"]
+            supplied_key = request.headers.get("Idempotency-Key")
+            expected_key = f"anton-continuation:{delivery_id}"
+            if supplied_key != expected_key:
+                return web.json_response(_openai_error("Invalid ANTON continuation idempotency key"), status=400)
+            # raw_body is strict canonical JSON after origin verification; bind
+            # identity to its authenticated origin generation/context too.
+            fingerprint = hashlib.sha256(
+                raw_body + b"\n" + verified_v2_origin.key_id.encode("utf-8")
+                + b"\n" + json.dumps(verified_v2_origin.context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            continuation_idempotency_key = supplied_key
+
         raw_input = body.get("input")
         if raw_input is None:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -5686,6 +5805,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         run_id = f"run_{uuid.uuid4().hex}"
+        if continuation_idempotency_key is not None:
+            # Trusted continuation identity survives adapter recreation.  Its
+            # authenticated delivery ID is the only ID-generation input;
+            # ordinary Runs intentionally remain random.
+            run_id = "run_" + hashlib.sha256(
+                b"hermes.api.runs.anton.synthesize-only.run-id.v1\x00"
+                + delivery_id.encode("utf-8")
+            ).hexdigest()[:32]
+        continuation_owner_uuid: Optional[str] = None
+        if continuation_idempotency_key is not None:
+            continuation_owner_uuid = uuid.uuid4().hex
+            claim = self._response_store.claim_anton_synthesis(
+                continuation_idempotency_key, fingerprint, run_id, continuation_owner_uuid,
+                lease_seconds=self._ANTON_SYNTHESIS_LEASE_SECONDS,
+            )
+            if claim["decision"] == "conflict":
+                return web.json_response(_openai_error("Idempotency key request conflict", code="idempotency_conflict"), status=409)
+            run_id = claim["run_id"]
+            if claim["decision"] != "owner":
+                # A second adapter/process either observes the active lease or
+                # a durable terminal result.  Terminal state is hydrated for
+                # GET recovery, but neither path schedules a second execution.
+                saved_status = claim.get("status")
+                if isinstance(saved_status, dict):
+                    self._run_statuses[run_id] = saved_status
+                return web.json_response({"run_id": run_id, "status": "started"}, status=202)
         session_id = body.get("session_id") or stored_session_id or run_id
         if verified_v2_origin is not None:
             try:
@@ -5780,6 +5925,19 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            heartbeat_task: Optional["asyncio.Task"] = None
+
+            async def _heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(self._ANTON_SYNTHESIS_HEARTBEAT_SECONDS)
+                    if not self._response_store.heartbeat_anton_synthesis(
+                        continuation_idempotency_key, continuation_owner_uuid,
+                        lease_seconds=self._ANTON_SYNTHESIS_LEASE_SECONDS,
+                    ):
+                        return
+
+            if continuation_idempotency_key is not None and continuation_owner_uuid is not None:
+                heartbeat_task = asyncio.create_task(_heartbeat())
             try:
                 if not synthesize_only:
                     self._set_run_status(run_id, "running")
@@ -5903,6 +6061,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                     verified_v2_origin is not None
                                     and trusted_anton_origin is not None
                                     and trusted_anton_origin.mode == "parent_continuation"
+                                    and self._detached_delivery_task is not None
+                                    and not self._detached_delivery_task.done()
                                     and _anton_detached_completion_sink_ready()
                                 ),
                             )
@@ -6076,6 +6236,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": error_msg,
                 })
             finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                if continuation_idempotency_key is not None and continuation_owner_uuid is not None:
+                    # The synthesize-only branches above have already applied
+                    # a closed/public projection. Persist it before dropping
+                    # the fenced lease so a recreated adapter can poll it.
+                    terminal_status = self._run_statuses.get(run_id)
+                    if isinstance(terminal_status, dict):
+                        safe_terminal = {
+                            key: terminal_status[key]
+                            for key in ("object", "run_id", "status", "created_at", "updated_at", "output", "error", "usage")
+                            if key in terminal_status
+                        }
+                        # Never retain private request context, artifacts, or
+                        # arbitrary agent fields in this recovery record.
+                        self._run_statuses[run_id] = safe_terminal
+                        self._response_store.finish_anton_synthesis(
+                            continuation_idempotency_key, continuation_owner_uuid, safe_terminal,
+                        )
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -6129,6 +6312,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        if status is None:
+            # A recreated adapter has no process map. Only terminal, public
+            # synthesize-only status is retained in this durable table.
+            status = self._response_store.get_anton_synthesis_status(run_id)
+            if status is not None:
+                self._run_statuses[run_id] = status
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -6568,6 +6757,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
 
             self._mark_connected()
+            # The recovery owner exists only after aiohttp's runner and site
+            # are live; disconnect() owns cancellation for this exact task.
+            if _anton_detached_completion_sink_ready() and self._detached_delivery_task is None:
+                self._detached_delivery_task = asyncio.create_task(self._detached_delivery_loop())
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,
@@ -6575,6 +6768,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return True
 
         except Exception as e:
+            # If a later startup operation fails after task allocation, do not
+            # leave recovery running for an adapter that never connected.
+            task, self._detached_delivery_task = self._detached_delivery_task, None
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
@@ -6591,6 +6793,13 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        task, self._detached_delivery_task = self._detached_delivery_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         if self._response_store is not None:
             try:
                 self._response_store.close()

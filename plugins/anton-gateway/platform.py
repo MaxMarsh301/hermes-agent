@@ -45,7 +45,15 @@ async def _send_delegation_record(record):
     body = record["body"]
     if not isinstance(body, bytes) or hashlib.sha256(body).hexdigest() != record["bodySha256"]:
         raise AntonTransportError("digest_mismatch", False)
-    return await AntonGatewayClient(AntonConfig.delegation_from_env()).deliver_delegation(body, record["deliveryId"])
+    key_id = record.get("signingKeyId")
+    if not isinstance(key_id, str) or not key_id:
+        raise AntonTransportError("missing_signing_key_generation", False)
+    config = AntonConfig.delegation_from_env()
+    try:
+        config.delegation_key_for(key_id)
+    except ValueError:
+        raise AntonTransportError("missing_signing_key_generation", False) from None
+    return await AntonGatewayClient(config).deliver_delegation(body, record["deliveryId"], key_id=key_id)
 
 
 async def retry_delegation_due(limit: int = 10) -> int:
@@ -54,9 +62,15 @@ async def retry_delegation_due(limit: int = 10) -> int:
     from .outbox import DelegationOutbox
     outbox = DelegationOutbox()
     outbox.ingest_handoffs(limit=limit)
+    # Resolve configured generations before claiming. A row pinned to a
+    # retired key (or legacy empty generation) stays pending and untouched.
+    config = AntonConfig.delegation_from_env()
+    signing_key_ids = [config.delegation_delivery_key_id]
+    if config.delegation_delivery_previous_key_id:
+        signing_key_ids.append(config.delegation_delivery_previous_key_id)
     delivered = 0
     for _ in range(max(0, int(limit))):
-        records = outbox.due(limit=1)
+        records = outbox.due(limit=1, signing_key_ids=signing_key_ids)
         if not records:
             break
         record = records[0]
