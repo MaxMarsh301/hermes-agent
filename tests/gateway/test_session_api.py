@@ -45,6 +45,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_get("/api/sessions/{session_id}/runtime-status", adapter._handle_session_runtime_status)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -73,6 +74,190 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
     }
+    assert data["endpoints"]["session_runtime_status"] == {
+        "method": "GET",
+        "path": "/api/sessions/{session_id}/runtime-status",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_status_requires_auth_and_404s(auth_adapter):
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        unauthenticated = await cli.get("/api/sessions/missing/runtime-status")
+        assert unauthenticated.status == 401
+
+        missing = await cli.get(
+            "/api/sessions/missing/runtime-status",
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert missing.status == 404
+        assert (await missing.json())["error"]["code"] == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_status_is_safe_and_reports_actual_context(adapter, session_db):
+    from types import SimpleNamespace
+
+    session_id = session_db.create_session("runtime-live", "api_server", model="configured-model")
+    session_db.append_message(session_id, "user", "safe persisted text")
+    session_db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        ('{"api_key":"secret","base_url":"https://private","reasoning_config":{"enabled":true,"effort":"high"},"service_tier":"priority"}', session_id),
+    )
+    session_db._conn.commit()
+    adapter._active_run_agents["run-live"] = SimpleNamespace(
+        model="effective-model",
+        _fallback_activated=True,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+        service_tier="priority",
+        context_compressor=SimpleNamespace(last_prompt_tokens=120, context_length=400),
+    )
+    adapter._run_statuses["run-live"] = {"session_id": session_id, "status": "running", "updated_at": 1}
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/runtime-status")
+        assert response.status == 200
+        payload = await response.json()
+
+    assert set(payload) == {
+        "sessionId", "configuredModel", "effectiveModel", "fallbackActive", "reasoningEffort", "fastMode",
+        "contextUsedTokens", "contextLimitTokens", "contextPercent", "contextMeasurement", "inputTokens",
+        "outputTokens", "activeRunState", "backgroundTaskCount", "lastCompressedAt", "updatedAt",
+    }
+    assert payload["sessionId"] == session_id
+    assert payload["configuredModel"] == "configured-model"
+    assert payload["effectiveModel"] == "effective-model"
+    assert payload["fallbackActive"] is True
+    assert payload["reasoningEffort"] == "xhigh"
+    assert payload["fastMode"] is True
+    assert payload["contextUsedTokens"] == 120
+    assert payload["contextLimitTokens"] == 400
+    assert payload["contextPercent"] == 30
+    assert payload["contextMeasurement"] == "actual"
+    assert payload["activeRunState"] == "running"
+    assert payload["lastCompressedAt"] is None
+    assert "secret" not in str(payload)
+    assert "private" not in str(payload)
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_status_estimates_with_configured_limit_or_leaves_unknown(adapter, session_db, monkeypatch):
+    estimated_id = session_db.create_session("runtime-estimated", "api_server", model="test-model")
+    session_db.append_message(estimated_id, "user", "estimate this persisted conversation")
+    unknown_id = session_db.create_session("runtime-unknown", "api_server", model="unknown-model")
+    session_db.append_message(unknown_id, "user", "estimate this unknown model")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "test-model", "context_length": 400}},
+    )
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        estimated = await (await cli.get(f"/api/sessions/{estimated_id}/runtime-status")).json()
+        # This global limit belongs to test-model, not unknown-model; do not
+        # report it for a session whose model metadata remains unknown.
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            lambda *args, **kwargs: 256_000,
+        )
+        unknown = await (await cli.get(f"/api/sessions/{unknown_id}/runtime-status")).json()
+
+    assert estimated["contextMeasurement"] == "estimated"
+    assert isinstance(estimated["contextUsedTokens"], int) and estimated["contextUsedTokens"] > 0
+    assert estimated["contextLimitTokens"] == 400
+    assert estimated["contextPercent"] == round(estimated["contextUsedTokens"] / 400 * 100)
+    assert unknown["contextMeasurement"] == "estimated"
+    assert isinstance(unknown["contextUsedTokens"], int) and unknown["contextUsedTokens"] > 0
+    assert unknown["contextLimitTokens"] is None
+    assert unknown["contextPercent"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_status_prefers_matching_config_override_over_model_metadata(
+    adapter, session_db, monkeypatch,
+):
+    """A deliberate Hermes cap must beat a provider catalog's larger window."""
+    session_id = session_db.create_session("runtime-capped", "api_server", model="gpt-5.6-sol")
+    session_db.append_message(session_id, "user", "estimate this capped conversation")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "gpt-5.6-sol", "context_length": 272_000}},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *args, **kwargs: 1_050_000,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        payload = await (await cli.get(f"/api/sessions/{session_id}/runtime-status")).json()
+
+    assert payload["configuredModel"] == "gpt-5.6-sol"
+    assert payload["effectiveModel"] == "gpt-5.6-sol"
+    assert payload["contextLimitTokens"] == 272_000
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_status_does_not_apply_configured_cap_to_fallback_model(
+    adapter, session_db, monkeypatch,
+):
+    """A fallback model keeps its own context limit, not the configured model's cap."""
+    session_id = session_db.create_session("runtime-fallback-cap", "api_server", model="fallback-model")
+    session_db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        ('{"gateway_runtime":{"configured_model":"gpt-5.6-sol","fallback_active":true}}', session_id),
+    )
+    session_db._conn.commit()
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "gpt-5.6-sol", "context_length": 272_000}},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *args, **kwargs: 400_000,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        payload = await (await cli.get(f"/api/sessions/{session_id}/runtime-status")).json()
+
+    assert payload["configuredModel"] == "gpt-5.6-sol"
+    assert payload["effectiveModel"] == "fallback-model"
+    assert payload["contextLimitTokens"] == 400_000
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_status_keeps_configured_model_after_fallback_sync(adapter, session_db):
+    """A completed fallback run must not make configured/effective indistinguishable."""
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+
+    session_id = session_db.create_session("runtime-fallback", "api_server", model="configured-model")
+    session_db.append_message(session_id, "user", "persist the fallback model")
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = SimpleNamespace(_db=session_db)
+    runner._sync_session_model_from_agent(
+        session_id,
+        SimpleNamespace(
+            model="fallback-model",
+            provider="fallback-provider",
+            base_url="https://fallback.invalid",
+            api_mode="responses",
+            _fallback_activated=True,
+        ),
+    )
+
+    synced = session_db.get_session(session_id)
+    assert synced["model"] == "fallback-model"
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        payload = await (await cli.get(f"/api/sessions/{session_id}/runtime-status")).json()
+
+    assert payload["configuredModel"] == "configured-model"
+    assert payload["effectiveModel"] == "fallback-model"
+    assert payload["fallbackActive"] is True
 
 
 @pytest.mark.asyncio
@@ -209,6 +394,40 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["title"] == "Alternative"
     assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
     assert session_db.get_session(source_id)["end_reason"] == "branched"
+
+
+@pytest.mark.asyncio
+async def test_session_fork_can_preserve_source_for_product_ui(adapter, session_db):
+    source_id = session_db.create_session("source-live", "api_server", model="test-model")
+    session_db.set_session_title(source_id, "Original")
+    session_db.append_message(source_id, "user", "keep both paths")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={"id": "source-live-child", "title": "Original — ветка", "preserve_source": True},
+        )
+        assert resp.status == 201
+        payload = await resp.json()
+
+    assert payload["session"]["id"] == "source-live-child"
+    assert payload["session"]["parent_session_id"] == source_id
+    assert session_db.get_session(source_id)["end_reason"] is None
+    assert [m["content"] for m in session_db.get_messages("source-live-child")] == ["keep both paths"]
+
+
+@pytest.mark.asyncio
+async def test_session_fork_rejects_unknown_or_invalid_preserve_source(adapter, session_db):
+    source_id = session_db.create_session("source-invalid", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        unknown = await cli.post(f"/api/sessions/{source_id}/fork", json={"shell": "no"})
+        invalid = await cli.post(f"/api/sessions/{source_id}/fork", json={"preserve_source": "yes"})
+
+    assert unknown.status == 400
+    assert invalid.status == 400
+    assert session_db.get_session(source_id)["end_reason"] is None
 
 
 @pytest.mark.asyncio

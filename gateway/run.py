@@ -4087,6 +4087,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not isinstance(config, dict):
                 config = {}
             gateway_runtime = dict(config.get("gateway_runtime") or {})
+            # ``model`` is deliberately updated to the backend that answered
+            # the turn.  Preserve the originally configured model separately
+            # before that overwrite so runtime-status can distinguish it from
+            # a fallback after this agent has left the in-memory cache.  This
+            # narrow marker is the only extra session configuration retained;
+            # never copy credentials or the broader model configuration into
+            # gateway_runtime.
+            configured_model = gateway_runtime.get("configured_model")
+            if not isinstance(configured_model, str) or not configured_model.strip():
+                configured_model = current_model if isinstance(current_model, str) and current_model.strip() else None
+            if configured_model is not None:
+                runtime["configured_model"] = configured_model
             if current_model == model and all(
                 gateway_runtime.get(k) == v for k, v in runtime.items()
             ):

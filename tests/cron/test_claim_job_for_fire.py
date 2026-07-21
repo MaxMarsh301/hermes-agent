@@ -7,15 +7,43 @@ claim for a given fire. Single-machine deployments always win (unaffected).
 These exercise the real store against a temp HERMES_HOME (no mocks) per the
 E2E-over-mocks discipline for file-touching code.
 """
+import json
+
 import pytest
+
+import cron.jobs as jobs
 
 
 @pytest.fixture
 def temp_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME so jobs.json doesn't touch the real store."""
+    """Isolate cron storage even when cron.jobs was imported before setup."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    # cron.jobs caches no home at import; get_hermes_home() reads the env live.
-    yield tmp_path
+    with jobs.use_cron_store(tmp_path):
+        yield tmp_path
+
+
+def test_temp_home_routes_preimported_jobs_module_away_from_its_default_store(
+    temp_home, tmp_path, monkeypatch
+):
+    """A cached cron.jobs module must not write its import-time default store."""
+    cached_default_home = tmp_path / "cached-default"
+    cached_cron_dir = cached_default_home / "cron"
+    cached_jobs_file = cached_cron_dir / "jobs.json"
+    monkeypatch.setattr(jobs, "HERMES_DIR", cached_default_home)
+    monkeypatch.setattr(jobs, "CRON_DIR", cached_cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cached_jobs_file)
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cached_cron_dir / "output")
+
+    sentinel = [{"id": "must-not-change"}]
+    cached_jobs_file.parent.mkdir(parents=True, exist_ok=True)
+    cached_jobs_file.write_text(json.dumps(sentinel), encoding="utf-8")
+
+    created = jobs.create_job(prompt="x", schedule="every 5m", name="isolated")
+
+    assert json.loads(cached_jobs_file.read_text(encoding="utf-8")) == sentinel
+    isolated_jobs_file = temp_home / "cron" / "jobs.json"
+    isolated_store = json.loads(isolated_jobs_file.read_text(encoding="utf-8"))
+    assert created["id"] in {job["id"] for job in isolated_store["jobs"]}
 
 
 def test_claim_succeeds_once_then_blocks(temp_home):
