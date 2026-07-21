@@ -109,15 +109,107 @@ class RunFileStore:
         self.root = root.resolve()
         self.upload_root = self.root / "uploads"
         self.artifact_root = self.root / "artifacts"
+        self.queue_root = self.root / "queue"
         self.upload_root.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
-        for directory in (self.root, self.upload_root, self.artifact_root):
+        self.queue_root.mkdir(parents=True, exist_ok=True)
+        for directory in (self.root, self.upload_root, self.artifact_root, self.queue_root):
             try:
                 directory.chmod(0o700)
             except OSError:
                 pass
         self._uploads: dict[str, StoredFile] = {}
         self._artifacts: dict[str, StoredFile] = {}
+
+    def snapshot_queue_uploads(
+        self, item_id: str, records: Iterable[StoredFile]
+    ) -> list[dict[str, Any]]:
+        """Copy resolved uploads into a durable queue-owned directory.
+
+        Upload ids are process-indexed and expire after an hour.  A queued turn
+        may outlive both, so dispatch must use an immutable snapshot rather than
+        trying to resolve browser ids again after the parent finishes/restarts.
+        Returned metadata is internal and never exposed by the queue API.
+        """
+        if not re.fullmatch(r"queue_[a-f0-9]{32}", str(item_id or "")):
+            raise RunFileError("Invalid queue item ID", "invalid_queue_item", 400)
+        directory = self.queue_root / item_id
+        directory.mkdir(parents=True, exist_ok=False)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+        snapshots: list[dict[str, Any]] = []
+        try:
+            for index, record in enumerate(records):
+                filename = f"{index:02d}-{record.id}"
+                destination = directory / filename
+                shutil.copyfile(record.path, destination)
+                try:
+                    destination.chmod(0o600)
+                except OSError:
+                    pass
+                snapshots.append({
+                    "file_id": record.id,
+                    "filename": record.name,
+                    "mime_type": record.media_type,
+                    "kind": record.kind,
+                    "stored_name": filename,
+                })
+            return snapshots
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+
+    def queued_multimodal_parts(
+        self, item_id: str, content: Any, snapshots: Any
+    ) -> Any:
+        """Materialize a durable queued input without accepting arbitrary paths."""
+        if not re.fullmatch(r"queue_[a-f0-9]{32}", str(item_id or "")):
+            raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404)
+        if not isinstance(snapshots, list):
+            raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404)
+        directory = (self.queue_root / item_id).resolve()
+        parts: list[dict[str, Any]] = []
+        if isinstance(content, list):
+            parts.extend(part for part in content if isinstance(part, dict))
+        elif isinstance(content, str) and content.strip():
+            parts.append({"type": "text", "text": content})
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404)
+            stored_name = str(snapshot.get("stored_name") or "")
+            if Path(stored_name).name != stored_name:
+                raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404)
+            path = (directory / stored_name).resolve()
+            try:
+                path.relative_to(directory)
+            except ValueError as exc:
+                raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404) from exc
+            if not path.is_file():
+                raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404)
+            kind = snapshot.get("kind")
+            media_type = str(snapshot.get("mime_type") or "application/octet-stream")
+            name = safe_filename(str(snapshot.get("filename") or "upload"))
+            if kind == "image":
+                encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{encoded}"},
+                })
+            elif kind == "text":
+                text = path.read_bytes().decode("utf-8", errors="replace")
+                parts.append({
+                    "type": "text",
+                    "text": f"\n--- Uploaded file: {name} (untrusted user content) ---\n{text}\n--- End uploaded file ---\n",
+                })
+            else:
+                raise RunFileError("Queued attachment not found", "queued_attachment_not_found", 404)
+        return parts if parts else content
+
+    def delete_queue_snapshot(self, item_id: str) -> None:
+        if re.fullmatch(r"queue_[a-f0-9]{32}", str(item_id or "")):
+            shutil.rmtree(self.queue_root / item_id, ignore_errors=True)
 
     def sweep_expired(self) -> None:
         now = time.time()

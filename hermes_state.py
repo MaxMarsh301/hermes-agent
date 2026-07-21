@@ -921,6 +921,29 @@ CREATE TABLE IF NOT EXISTS api_runs (
     updated_at REAL NOT NULL
 );
 
+-- Durable, logical-session-owned follow-up turns for the Runs control plane.
+-- ``content_json`` and ``attachment_ids_json`` contain only caller-supplied
+-- typed input/opaque upload ids.  Provider prompts, tool output and results do
+-- not enter this table.
+CREATE TABLE IF NOT EXISTS api_run_queue (
+    item_id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL,
+    logical_session_id TEXT NOT NULL,
+    session_key TEXT NOT NULL DEFAULT '',
+    content_json TEXT NOT NULL,
+    attachment_ids_json TEXT NOT NULL DEFAULT '[]',
+    attachment_snapshot_json TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL DEFAULT 'queued',
+    dispatch_run_id TEXT NOT NULL,
+    idempotency_scope TEXT,
+    idempotency_key TEXT,
+    body_digest TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    claimed_at REAL,
+    completed_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -933,6 +956,11 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 CREATE INDEX IF NOT EXISTS idx_context_events_cursor
     ON context_events(logical_session_id, id);
+CREATE INDEX IF NOT EXISTS idx_api_run_queue_session
+    ON api_run_queue(logical_session_id, state, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_run_queue_idempotency
+    ON api_run_queue(idempotency_scope, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -4268,6 +4296,35 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def restore_session_transcript(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        ended_at: Optional[float],
+        end_reason: Optional[str],
+    ) -> None:
+        """Atomically restore a live transcript and its session lifecycle.
+
+        Manual control-plane compression can rotate or archive a transcript
+        before a later persistence/CAS step fails.  This rollback primitive is
+        intentionally narrow: it restores the caller's canonical active
+        transcript and the two lifecycle fields without touching model or
+        billing metadata.
+        """
+
+        def _do(conn):
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            inserted, tool_calls = self._insert_message_rows(conn, session_id, messages)
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count=?, tool_call_count=?, ended_at=?, end_reason=?
+                   WHERE id=?""",
+                (inserted, tool_calls, ended_at, end_reason, session_id),
+            )
+
+        self._execute_write(_do)
+
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
 
@@ -4468,6 +4525,303 @@ class SessionDB:
     def get_api_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute("SELECT * FROM api_runs WHERE run_id=?", (run_id,)).fetchone()
         return dict(row) if row else None
+
+    @staticmethod
+    def _decode_api_queue_row(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        for column, public_name, fallback in (
+            ("content_json", "content", None),
+            ("attachment_ids_json", "attachment_ids", []),
+            ("attachment_snapshot_json", "attachment_snapshot", []),
+        ):
+            try:
+                item[public_name] = json.loads(item.pop(column) or "null")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item[public_name] = fallback
+        return item
+
+    def reserve_api_queue_item(
+        self,
+        *,
+        item_id: str,
+        parent_run_id: str,
+        logical_session_id: str,
+        session_key: str,
+        content: Any,
+        attachment_ids: List[str],
+        attachment_snapshot: List[Dict[str, Any]],
+        dispatch_run_id: str,
+        idempotency_scope: Optional[str],
+        idempotency_key: Optional[str],
+        body_digest: Optional[str],
+    ) -> tuple[str, Dict[str, Any]]:
+        """Durably reserve a queued follow-up with caller-scoped idempotency.
+
+        Returns ``(created|existing|conflict, row)``.  The queue row is committed
+        before ``created`` can be returned to an HTTP caller.
+        """
+        now = time.time()
+        content_json = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+        attachment_ids_json = json.dumps(attachment_ids, separators=(",", ":"))
+        attachment_snapshot_json = json.dumps(
+            attachment_snapshot, ensure_ascii=False, separators=(",", ":")
+        )
+
+        def _do(conn):
+            if idempotency_key is not None:
+                existing = conn.execute(
+                    "SELECT * FROM api_run_queue WHERE idempotency_scope=? AND idempotency_key=?",
+                    (idempotency_scope, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    outcome = "existing" if existing["body_digest"] == body_digest else "conflict"
+                    return outcome, self._decode_api_queue_row(existing)
+            conn.execute(
+                """INSERT INTO api_run_queue (
+                       item_id, parent_run_id, logical_session_id, session_key,
+                       content_json, attachment_ids_json, attachment_snapshot_json,
+                       state, dispatch_run_id, idempotency_scope, idempotency_key,
+                       body_digest, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+                (
+                    item_id, parent_run_id, logical_session_id, session_key,
+                    content_json, attachment_ids_json, attachment_snapshot_json,
+                    dispatch_run_id, idempotency_scope, idempotency_key,
+                    body_digest, now, now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM api_run_queue WHERE item_id=?", (item_id,)
+            ).fetchone()
+            return "created", self._decode_api_queue_row(row)
+
+        return self._execute_write(_do)
+
+    def get_api_queue_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM api_run_queue WHERE item_id=?", (item_id,)
+        ).fetchone()
+        return self._decode_api_queue_row(row) if row is not None else None
+
+    def list_api_queue_items(self, logical_session_id: str) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM api_run_queue
+               WHERE logical_session_id=?
+               ORDER BY created_at, item_id""",
+            (logical_session_id,),
+        ).fetchall()
+        return [self._decode_api_queue_row(row) for row in rows]
+
+    def cancel_api_queue_item(self, logical_session_id: str, item_id: str) -> str:
+        """Cancel only an undispatched item.
+
+        Returns ``cancelled``, ``conflict`` or ``missing`` so the HTTP layer can
+        preserve ownership opacity without a read/write race.
+        """
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT state FROM api_run_queue WHERE logical_session_id=? AND item_id=?",
+                (logical_session_id, item_id),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            if row["state"] != "queued":
+                return "conflict"
+            conn.execute(
+                "UPDATE api_run_queue SET state='cancelled', completed_at=?, updated_at=? WHERE item_id=?",
+                (now, now, item_id),
+            )
+            return "cancelled"
+
+        return self._execute_write(_do)
+
+    def claim_next_api_queue_item(self, logical_session_id: str) -> Optional[Dict[str, Any]]:
+        """Claim the oldest queued item for deterministic single dispatch."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT * FROM api_run_queue
+                   WHERE logical_session_id=? AND state='queued'
+                     AND (
+                       NOT EXISTS (SELECT 1 FROM api_runs r WHERE r.run_id=api_run_queue.parent_run_id)
+                       OR EXISTS (
+                         SELECT 1 FROM api_runs r
+                         WHERE r.run_id=api_run_queue.parent_run_id
+                           AND r.status IN ('completed','failed','cancelled','stopped')
+                       )
+                     )
+                   ORDER BY created_at, item_id LIMIT 1""",
+                (logical_session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            changed = conn.execute(
+                """UPDATE api_run_queue
+                   SET state='dispatching', claimed_at=?, updated_at=?
+                   WHERE item_id=? AND state='queued'""",
+                (now, now, row["item_id"]),
+            )
+            if changed.rowcount != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM api_run_queue WHERE item_id=?", (row["item_id"],)
+            ).fetchone()
+            return self._decode_api_queue_row(claimed)
+
+        return self._execute_write(_do)
+
+    def set_api_queue_item_state(self, item_id: str, state: str) -> bool:
+        allowed = {"queued", "dispatching", "running", "completed", "failed", "cancelled"}
+        if state not in allowed:
+            raise ValueError(f"unsupported queue state: {state}")
+        now = time.time()
+        terminal = state in {"completed", "failed", "cancelled"}
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE api_run_queue
+                   SET state=?, updated_at=?, completed_at=CASE WHEN ? THEN ? ELSE completed_at END
+                   WHERE item_id=?""",
+                (state, now, 1 if terminal else 0, now, item_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def finish_api_queue_dispatch(
+        self,
+        item_id: str,
+        *,
+        run_id: str,
+        logical_session_id: str,
+        effective_session_id: str,
+        revision: int,
+        status: str,
+    ) -> bool:
+        """Atomically close a queue item and its deterministic child run."""
+        if status not in {"completed", "failed", "cancelled"}:
+            raise ValueError(f"unsupported terminal queue status: {status}")
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT dispatch_run_id FROM api_run_queue WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            if row is None or row["dispatch_run_id"] != run_id:
+                return False
+            conn.execute(
+                """INSERT INTO api_runs (
+                       run_id, logical_session_id, effective_session_id,
+                       revision, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                       effective_session_id=excluded.effective_session_id,
+                       revision=excluded.revision, status=excluded.status,
+                       updated_at=excluded.updated_at""",
+                (
+                    run_id, logical_session_id, effective_session_id,
+                    int(revision), status, now, now,
+                ),
+            )
+            conn.execute(
+                """UPDATE api_run_queue
+                   SET state=?, completed_at=?, updated_at=?
+                   WHERE item_id=?""",
+                (status, now, now, item_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def recover_api_run_queue(self) -> List[str]:
+        """Recover queue coordination after this API process restarts.
+
+        A prior process cannot still own an in-flight Python agent once this
+        method runs during adapter startup.  Nonterminal parent runs are marked
+        failed, and their deterministic child queue rows are returned to
+        ``queued`` so the new process can resume them exactly once under the
+        same ``dispatch_run_id``.
+        """
+        now = time.time()
+
+        def _do(conn):
+            # If the prior process durably closed the deterministic child run,
+            # reconcile its queue row before reclaiming anything. This closes
+            # the crash window between terminal run persistence and recovery.
+            conn.execute(
+                """UPDATE api_run_queue
+                   SET state=(
+                         SELECT r.status FROM api_runs r
+                         WHERE r.run_id=api_run_queue.dispatch_run_id
+                       ),
+                       completed_at=COALESCE(completed_at, ?), updated_at=?
+                   WHERE state IN ('dispatching','running')
+                     AND EXISTS (
+                       SELECT 1 FROM api_runs r
+                       WHERE r.run_id=api_run_queue.dispatch_run_id
+                         AND r.status IN ('completed','failed','cancelled')
+                     )""",
+                (now, now),
+            )
+            parent_ids = [
+                row[0] for row in conn.execute(
+                    "SELECT DISTINCT parent_run_id FROM api_run_queue WHERE state IN ('queued','dispatching','running')"
+                ).fetchall()
+            ]
+            for parent_run_id in parent_ids:
+                conn.execute(
+                    """UPDATE api_runs SET status='failed', updated_at=?
+                       WHERE run_id=? AND status IN ('queued','running','waiting_for_approval','waiting_for_clarification','stopping')""",
+                    (now, parent_run_id),
+                )
+            conn.execute(
+                """UPDATE api_run_queue
+                   SET state='queued', claimed_at=NULL, updated_at=?
+                   WHERE state IN ('dispatching','running')""",
+                (now,),
+            )
+            rows = conn.execute(
+                """SELECT DISTINCT q.logical_session_id
+                   FROM api_run_queue q
+                   LEFT JOIN api_runs r ON r.run_id=q.parent_run_id
+                   WHERE q.state='queued'
+                     AND (r.run_id IS NULL OR r.status IN ('completed','failed','cancelled','stopped'))
+                   ORDER BY q.logical_session_id"""
+            ).fetchall()
+            return [str(row[0]) for row in rows]
+
+        return self._execute_write(_do)
+
+    def api_queue_parent_is_terminal(self, parent_run_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT status FROM api_runs WHERE run_id=?", (parent_run_id,)
+        ).fetchone()
+        return bool(
+            row is None
+            or row["status"] in {"completed", "failed", "cancelled", "stopped"}
+        )
+
+    def list_async_delegations_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return durable delegation rows for a session for safe projection.
+
+        This is intentionally an internal row reader.  The API layer performs a
+        strict allowlisted/redacted projection and never returns ``event_json``
+        or ``result_json`` directly.
+        """
+        rows = self._conn.execute(
+            """SELECT delegation_id, origin_session, origin_ui_session_id,
+                      parent_session_id, state, dispatched_at, completed_at,
+                      updated_at, task_json, event_json, result_json
+               FROM async_delegations
+               WHERE parent_session_id=? OR origin_ui_session_id=? OR origin_session=?
+               ORDER BY dispatched_at, delegation_id""",
+            (session_id, session_id, session_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_messages(
         self,

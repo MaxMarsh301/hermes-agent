@@ -13,12 +13,17 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - GET  /api/sessions/{session_id}/runtime-status — safe runtime/status summary
+- POST /api/sessions/{session_id}/compress — typed manual context compression
+- PATCH /api/sessions/{session_id}/settings — safe per-session model controls
+- GET  /api/sessions/{session_id}/background-tasks — durable safe task aggregate
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
+- POST /v1/runs/{run_id}/steer — enqueue bounded steering on a live agent
+- POST/GET/DELETE /v1/runs/{run_id}/queue — durable follow-up queue
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
@@ -1470,6 +1475,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Session chat and Runs share the same mutation-conflict contract.
+        # Counts cover direct chat calls while _run_statuses covers Runs.
+        self._active_session_runs: Dict[str, int] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -1477,6 +1485,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Logical-session domains serialize history load -> agent turn -> pointer
         # reconciliation. SQLite remains the cross-restart source of truth.
         self._context_locks: Dict[str, asyncio.Lock] = {}
+        self._queue_locks: Dict[str, asyncio.Lock] = {}
+        self._queue_dispatch_tasks: Dict[str, "asyncio.Task"] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -2012,6 +2022,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("GET", "/api/sessions/{session_id}/runtime-status", self._handle_session_runtime_status),
+            ("POST", "/api/sessions/{session_id}/compress", self._handle_session_compress),
+            ("PATCH", "/api/sessions/{session_id}/settings", self._handle_session_settings),
+            ("GET", "/api/sessions/{session_id}/background-tasks", self._handle_session_background_tasks),
             ("GET", "/api/sessions/{session_id}/context-state", self._handle_context_state),
             ("GET", "/api/sessions/{session_id}/context-events", self._handle_context_events),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
@@ -2042,6 +2055,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/artifacts/{artifact_id}/download", self._handle_download_artifact),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/clarification", self._handle_run_clarification),
+            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+            ("POST", "/v1/runs/{run_id}/queue", self._handle_queue_run),
+            ("GET", "/v1/runs/{run_id}/queue", self._handle_list_run_queue),
+            ("DELETE", "/v1/runs/{run_id}/queue/{item_id}", self._handle_cancel_run_queue_item),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2209,6 +2226,40 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         return self._model_routes.get(model_alias)
 
+    def _configured_api_models(self) -> Dict[str, str]:
+        """Return public configured IDs mapped to their effective model IDs."""
+        try:
+            from gateway.run import _resolve_gateway_model
+            primary = str(_resolve_gateway_model() or self._model_name)
+        except Exception:
+            primary = self._model_name
+        models = {self._model_name: primary}
+        for alias, route in self._model_routes.items():
+            model = route.get("model")
+            if isinstance(model, str) and model:
+                models[alias] = model
+        return models
+
+    def _session_control_overrides(self, session_id: Optional[str]) -> Dict[str, Any]:
+        """Read only the allowlisted per-session control-plane overrides."""
+        if not session_id:
+            return {}
+        db = self._ensure_session_db()
+        session = db.get_session(session_id) if db is not None else None
+        raw = session.get("model_config") if isinstance(session, dict) else None
+        try:
+            config = json.loads(raw) if isinstance(raw, str) and raw else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        value = config.get("api_session_overrides") if isinstance(config, dict) else None
+        if not isinstance(value, dict):
+            return {}
+        return {
+            key: value[key]
+            for key in ("model", "reasoningEffort", "fastMode")
+            if key in value
+        }
+
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
@@ -2243,6 +2294,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         synthesize_only: bool = False,
+        settings_session_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2335,6 +2387,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key or session_id,
             )
 
+        # Typed session settings are deliberately applied last and only to
+        # this agent instance.  They never mutate GatewayRunner globals or a
+        # caller-selected route shared by another session.
+        control_overrides = self._session_control_overrides(
+            settings_session_id or session_id
+        )
+        configured_model = control_overrides.get("model")
+        if isinstance(configured_model, str):
+            configured_models = self._configured_api_models()
+            effective_model = configured_models.get(configured_model)
+            persisted_route = self._resolve_route(configured_model)
+            if effective_model is not None:
+                if persisted_route and persisted_route.get("provider"):
+                    try:
+                        from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+                        provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                            persisted_route["provider"]
+                        )
+                        provider_kwargs.pop("model", None)
+                        runtime_kwargs.update(provider_kwargs)
+                    except Exception:
+                        runtime_kwargs["provider"] = persisted_route["provider"]
+                if persisted_route:
+                    for key in ("api_key", "base_url"):
+                        if persisted_route.get(key):
+                            runtime_kwargs[key] = persisted_route[key]
+                model = effective_model
+        effort = control_overrides.get("reasoningEffort")
+        if effort in {"none", "low", "medium", "high", "max"}:
+            reasoning_config = None if effort == "none" else {"effort": effort}
+
+        request_overrides = None
+        service_tier = GatewayRunner._load_service_tier()
+        if control_overrides.get("fastMode") is False:
+            service_tier = None
+        elif control_overrides.get("fastMode") is True:
+            from hermes_cli.models import resolve_fast_mode_overrides
+            request_overrides = resolve_fast_mode_overrides(model)
+            service_tier = (
+                request_overrides.get("service_tier")
+                if isinstance(request_overrides, dict)
+                else None
+            )
+
         user_config = _load_gateway_config()
         # This is a request-local deny policy: synthesize-only never resolves
         # configured toolsets, while every concurrent ordinary run remains unchanged.
@@ -2373,6 +2469,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
             gateway_session_key=gateway_session_key,
             # Per-request capability boundary; never mutate global tool config.
             restricted_execution=synthesize_only,
@@ -2510,6 +2608,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
+            "models": sorted(self._configured_api_models()),
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
@@ -2533,6 +2632,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_steer": True,
+                "durable_run_queue": True,
                 "run_approval_response": True,
                 "run_clarification_response": True,
                 "run_file_uploads": True,
@@ -2545,6 +2646,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_compression": True,
+                "session_settings": True,
+                "session_background_tasks": True,
+                "background_task_cancellation": False,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2571,6 +2676,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_artifacts": {"method": "GET", "path": "/v1/runs/{run_id}/artifacts"},
                 "run_artifact_download": {"method": "GET", "path": "/v1/runs/{run_id}/artifacts/{artifact_id}/download"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "run_queue_create": {"method": "POST", "path": "/v1/runs/{run_id}/queue"},
+                "run_queue_list": {"method": "GET", "path": "/v1/runs/{run_id}/queue"},
+                "run_queue_cancel": {"method": "DELETE", "path": "/v1/runs/{run_id}/queue/{item_id}"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -2580,6 +2689,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_runtime_status": {"method": "GET", "path": "/api/sessions/{session_id}/runtime-status"},
+                "session_compress": {"method": "POST", "path": "/api/sessions/{session_id}/compress"},
+                "session_settings": {"method": "PATCH", "path": "/api/sessions/{session_id}/settings"},
+                "session_background_tasks": {"method": "GET", "path": "/api/sessions/{session_id}/background-tasks"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -2885,8 +2997,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # non-secret runtime marker before ``session.model`` is overwritten by
         # a fallback.  Legacy rows lack it, so their persisted model is the
         # best truthful value available for both configured/effective fields.
-        configured_model = runtime.get("configured_model") or session.get("model") or None
-        effective_model = getattr(agent, "model", None) or session.get("model") or configured_model
+        control = config.get("api_session_overrides")
+        control = control if isinstance(control, dict) else {}
+        configured_model = control.get("model") or runtime.get("configured_model") or session.get("model") or None
+        configured_effective = self._configured_api_models().get(configured_model, configured_model)
+        persisted_effective = configured_effective if control.get("model") else session.get("model")
+        effective_model = getattr(agent, "model", None) or persisted_effective or configured_effective or configured_model
         fallback_active = (
             bool(getattr(agent, "_fallback_activated", False))
             if agent is not None
@@ -2894,10 +3010,16 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         reasoning_config = getattr(agent, "reasoning_config", None) if agent is not None else config.get("reasoning_config")
         reasoning_effort = None
-        if isinstance(reasoning_config, dict):
+        if control.get("reasoningEffort") in {"none", "low", "medium", "high", "max"}:
+            reasoning_effort = control["reasoningEffort"]
+        elif isinstance(reasoning_config, dict):
             reasoning_effort = "none" if reasoning_config.get("enabled") is False else (reasoning_config.get("effort") or None)
         service_tier = getattr(agent, "service_tier", None) if agent is not None else config.get("service_tier")
-        fast_mode = (service_tier == "priority") if service_tier is not None else None
+        if isinstance(control.get("fastMode"), bool):
+            from hermes_cli.models import model_supports_fast_mode
+            fast_mode = bool(control["fastMode"] and model_supports_fast_mode(effective_model))
+        else:
+            fast_mode = (service_tier == "priority") if service_tier is not None else None
 
         compressor = getattr(agent, "context_compressor", None) if agent is not None else None
         measured_context = getattr(compressor, "last_prompt_tokens", None) if compressor is not None else None
@@ -2987,6 +3109,407 @@ class APIServerAdapter(BasePlatformAdapter):
             "lastCompression": last_compression,
             "lastCompressedAt": context_state.get("last_compressed_at") if context_state else None,
             "updatedAt": updated_at,
+        })
+
+    _SESSION_MUTATION_ACTIVE_STATES = frozenset({
+        "queued", "running", "waiting_for_approval",
+        "waiting_for_clarification", "stopping",
+    })
+
+    def _session_has_active_run(self, session_id: str) -> bool:
+        if self._active_session_runs.get(session_id, 0) > 0:
+            return True
+        for status in self._run_statuses.values():
+            if status.get("status") not in self._SESSION_MUTATION_ACTIVE_STATES:
+                continue
+            if session_id in {
+                status.get("session_id"), status.get("logical_session_id"),
+                status.get("effective_session_id"),
+            }:
+                return True
+        return False
+
+    @staticmethod
+    def _session_active_conflict() -> "web.Response":
+        return web.json_response(
+            _openai_error(
+                "Session has an active run", code="session_active",
+            ),
+            status=409,
+        )
+
+    async def _handle_session_compress(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/compress — typed manual compaction."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        logical_id = request.match_info["session_id"]
+        session, err = self._get_existing_session_or_404(logical_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        allowed = {"mode", "focus", "keepRecentExchanges", "preview"}
+        if set(body) - allowed or body.get("mode") != "standard":
+            return web.json_response(
+                _openai_error("Expected strict compression body with mode='standard'", code="invalid_compression_request"),
+                status=400,
+            )
+        focus = body.get("focus")
+        if focus is not None and (
+            not isinstance(focus, str) or not focus.strip() or len(focus) > 1000
+        ):
+            return web.json_response(
+                _openai_error("focus must be null or a non-empty string of at most 1000 characters", code="invalid_focus"),
+                status=400,
+            )
+        keep = body.get("keepRecentExchanges")
+        if keep is not None and (
+            not isinstance(keep, int) or isinstance(keep, bool) or keep < 1 or keep > 100
+        ):
+            return web.json_response(
+                _openai_error("keepRecentExchanges must be an integer from 1 to 100", code="invalid_keep_recent"),
+                status=400,
+            )
+        preview = body.get("preview", False)
+        if not isinstance(preview, bool):
+            return web.json_response(
+                _openai_error("preview must be a boolean", code="invalid_preview"), status=400,
+            )
+        if self._session_has_active_run(logical_id):
+            return self._session_active_conflict()
+
+        db = self._ensure_session_db()
+        effective_id = db.resolve_resume_session_id(logical_id)
+        effective_session = db.get_session(effective_id)
+        if effective_session is None:
+            return web.json_response(
+                _openai_error("Session transcript is unavailable", code="session_not_found"), status=404,
+            )
+        original = db.get_messages_as_conversation(effective_id)
+        from agent.model_metadata import estimate_messages_tokens_rough
+        from hermes_cli.partial_compress import (
+            rejoin_compressed_head_and_tail, split_history_for_partial_compress,
+        )
+        before_tokens = estimate_messages_tokens_rough(original)
+        head, tail = (list(original), [])
+        if keep is not None:
+            head, tail = split_history_for_partial_compress(original, keep)
+        eligible = bool(original and head and len(original) >= 2)
+        if preview:
+            # Preview deliberately returns before creating context rows, locks,
+            # agents, provider clients, or compression lifecycle events.
+            return web.json_response({
+                "object": "hermes.session.compression.preview",
+                "preview": True,
+                "mode": "standard",
+                "originalSessionId": logical_id,
+                "resultingSessionId": effective_id,
+                "before": {"messageCount": len(original), "tokens": before_tokens, "measurement": "estimated"},
+                "estimate": {"compressMessageCount": len(head), "keepMessageCount": len(tail)},
+                "eligible": eligible,
+                "confirmationRequired": eligible,
+            })
+        if not eligible:
+            return web.json_response(
+                _openai_error("Session does not contain enough context to compress", code="compression_not_eligible"),
+                status=409,
+            )
+
+        lock = self._context_lock(logical_id)
+        async with lock:
+            if self._session_has_active_run(logical_id):
+                return self._session_active_conflict()
+            # Re-read under the lock: state.db is the canonical transcript.
+            effective_id = db.resolve_resume_session_id(logical_id)
+            effective_session = db.get_session(effective_id)
+            original = db.get_messages_as_conversation(effective_id)
+            before_tokens = estimate_messages_tokens_rough(original)
+            head, tail = (list(original), [])
+            if keep is not None:
+                head, tail = split_history_for_partial_compress(original, keep)
+            state = db.get_or_create_context_state(
+                logical_id, effective_session_id=effective_id,
+            )
+            resulting_id = effective_id
+            agent = None
+            try:
+                agent = await asyncio.to_thread(
+                    self._create_agent,
+                    session_id=effective_id,
+                    settings_session_id=logical_id,
+                )
+                compressed, _ = await asyncio.to_thread(
+                    agent._compress_context,
+                    head,
+                    None,
+                    approx_tokens=before_tokens,
+                    focus_topic=focus.strip() if isinstance(focus, str) else None,
+                    force=True,
+                )
+                compressor = getattr(agent, "context_compressor", None)
+                if (
+                    not isinstance(compressed, list) or not compressed
+                    or compressed is head or compressed == head
+                    or bool(getattr(compressor, "_last_compress_aborted", False))
+                ):
+                    raise RuntimeError("compression produced no transcript")
+                final_messages = rejoin_compressed_head_and_tail(compressed, tail)
+                resulting_id = getattr(agent, "session_id", effective_id) or effective_id
+                in_place = bool(getattr(agent, "_last_compaction_in_place", False))
+                db.replace_messages(resulting_id, final_messages, active_only=in_place)
+                after_tokens = estimate_messages_tokens_rough(final_messages)
+                advanced = db.advance_context_state(
+                    logical_id,
+                    expected_revision=int(state["revision"]),
+                    effective_session_id=resulting_id,
+                    event_type="session:compress",
+                    compressed=True,
+                    telemetry={
+                        "reason": "manual",
+                        "before": {"used": before_tokens, "measurement": "estimated"},
+                        "after": {"used": after_tokens, "measurement": "estimated"},
+                        "mode": "in_place" if in_place else "rotated",
+                    },
+                )
+                if advanced is None:
+                    raise RuntimeError("compression state changed concurrently")
+                return web.json_response({
+                    "object": "hermes.session.compression",
+                    "preview": False,
+                    "mode": "standard",
+                    "originalSessionId": logical_id,
+                    "resultingSessionId": resulting_id,
+                    "before": {"messageCount": len(original), "tokens": before_tokens, "measurement": "estimated"},
+                    "after": {"messageCount": len(final_messages), "tokens": after_tokens, "measurement": "estimated"},
+                    "compressedAt": advanced.get("last_compressed_at"),
+                    "contextRevision": advanced.get("revision"),
+                    "compressionCount": advanced.get("compression_epoch"),
+                })
+            except Exception:
+                # Provider/compressor errors can contain prompts or credentials;
+                # keep both the API response and server log projection fixed.
+                logger.error("[api_server] typed session compression failed for %s", logical_id)
+                try:
+                    rollback_child = (
+                        getattr(agent, "session_id", None) if agent is not None else resulting_id
+                    )
+                    if rollback_child != effective_id and db.get_session(rollback_child):
+                        db.delete_session(rollback_child)
+                    db.restore_session_transcript(
+                        effective_id,
+                        original,
+                        ended_at=effective_session.get("ended_at") if effective_session else None,
+                        end_reason=effective_session.get("end_reason") if effective_session else None,
+                    )
+                except Exception:
+                    logger.error("[api_server] compression rollback failed for %s", logical_id)
+                return web.json_response(
+                    _openai_error("Session compression failed; the original transcript was preserved", code="compression_failed"),
+                    status=500,
+                )
+
+    def _session_settings_projection(self, session_id: str) -> Dict[str, Any]:
+        from gateway.run import GatewayRunner
+        from hermes_cli.models import model_supports_fast_mode
+
+        overrides = self._session_control_overrides(session_id)
+        models = self._configured_api_models()
+        configured_id = overrides.get("model") or self._model_name
+        effective_model = models.get(configured_id, models[self._model_name])
+        effort = overrides.get("reasoningEffort")
+        if effort is None:
+            reasoning = GatewayRunner._load_reasoning_config(effective_model)
+            effort = reasoning.get("effort") if isinstance(reasoning, dict) else "none"
+        fast = overrides.get("fastMode")
+        if fast is None:
+            fast = GatewayRunner._load_service_tier() == "priority"
+        return {
+            "object": "hermes.session.settings",
+            "sessionId": session_id,
+            "configured": {
+                "model": configured_id,
+                "reasoningEffort": effort,
+                "fastMode": bool(fast),
+            },
+            "effective": {
+                "model": effective_model,
+                "reasoningEffort": effort,
+                "fastMode": bool(fast and model_supports_fast_mode(effective_model)),
+            },
+        }
+
+    async def _handle_session_settings(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        session, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        allowed = {"model", "reasoningEffort", "fastMode"}
+        if not body or set(body) - allowed:
+            return web.json_response(
+                _openai_error("Settings accepts only model, reasoningEffort, and fastMode", code="invalid_settings"), status=400,
+            )
+        if self._session_has_active_run(session_id):
+            return self._session_active_conflict()
+        models = self._configured_api_models()
+        if "model" in body and (
+            not isinstance(body["model"], str) or body["model"] not in models
+        ):
+            return web.json_response(
+                _openai_error("Model is not a configured API model or route", code="model_not_available"), status=400,
+            )
+        if "reasoningEffort" in body and body["reasoningEffort"] not in {"none", "low", "medium", "high", "max"}:
+            return web.json_response(
+                _openai_error("reasoningEffort must be none, low, medium, high, or max", code="invalid_reasoning_effort"), status=400,
+            )
+        if "fastMode" in body and not isinstance(body["fastMode"], bool):
+            return web.json_response(
+                _openai_error("fastMode must be a boolean", code="invalid_fast_mode"), status=400,
+            )
+        async with self._context_lock(session_id):
+            if self._session_has_active_run(session_id):
+                return self._session_active_conflict()
+            # Re-read under the mutation lock so unrelated model_config keys
+            # written by the agent are preserved.
+            session = self._ensure_session_db().get_session(session_id) or session
+            current = self._runtime_status_model_config(session)
+            overrides = current.get("api_session_overrides")
+            overrides = dict(overrides) if isinstance(overrides, dict) else {}
+            overrides.update(body)
+            selected_model = models.get(overrides.get("model") or self._model_name)
+            if overrides.get("fastMode") is True:
+                from hermes_cli.models import model_supports_fast_mode
+                if not model_supports_fast_mode(selected_model):
+                    return web.json_response(
+                        _openai_error("fastMode is not supported by the selected model", code="fast_mode_unsupported"), status=400,
+                    )
+            current["api_session_overrides"] = {
+                key: overrides[key] for key in ("model", "reasoningEffort", "fastMode") if key in overrides
+            }
+            self._ensure_session_db().update_session_meta(
+                session_id, json.dumps(current, ensure_ascii=False, separators=(",", ":")),
+            )
+        return web.json_response(self._session_settings_projection(session_id))
+
+    async def _handle_session_background_tasks(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        rows = self._ensure_session_db().list_async_delegations_for_session(session_id)
+        by_id: Dict[str, Dict[str, Any]] = {}
+        now = time.time()
+
+        def _normalized_state(value: Any) -> str:
+            state = str(value or "unknown").lower()
+            return {
+                "success": "completed", "error": "failed", "cancelled": "interrupted",
+            }.get(state, state if state in {
+                "queued", "running", "finalizing", "completed", "failed", "interrupted",
+            } else "unknown")
+
+        def _safe_goal(value: Any) -> Optional[str]:
+            projected = self._public_agent_goal(value)
+            return projected[0] if projected is not None else None
+
+        for row in rows:
+            delegation_id = str(row.get("delegation_id") or "")
+            if not delegation_id:
+                continue
+            state = _normalized_state(row.get("state"))
+            try:
+                task = json.loads(row.get("task_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                task = {}
+            try:
+                event = json.loads(row.get("event_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                event = {}
+            try:
+                result = json.loads(row.get("result_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result = {}
+            created_at = row.get("dispatched_at")
+            completed_at = row.get("completed_at")
+            item: Dict[str, Any] = {
+                "id": delegation_id,
+                "state": state,
+                "goal": _safe_goal(task.get("goal")) or (
+                    "Delegated task batch" if task.get("is_batch") else "Delegated task"
+                ),
+                "goalPublic": True,
+                "createdAt": created_at,
+                "updatedAt": completed_at or row.get("updated_at"),
+                "completedAt": completed_at,
+                "elapsedSeconds": round(max(0.0, float((completed_at or now) - created_at)), 2)
+                if isinstance(created_at, (int, float)) else None,
+                "toolCallCount": event.get("tool_call_count")
+                if isinstance(event.get("tool_call_count"), int) and not isinstance(event.get("tool_call_count"), bool) and event["tool_call_count"] >= 0
+                else None,
+                "parentSessionId": session_id,
+                "parentRunId": None,
+            }
+            parent_run = event.get("parentRunId") or event.get("parent_run_id")
+            if isinstance(parent_run, str) and re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", parent_run):
+                item["parentRunId"] = parent_run
+            if state in {"completed", "failed", "interrupted"}:
+                try:
+                    from tools.async_delegation import _safe_summary
+                    item["summary"] = _safe_summary(result if isinstance(result, dict) else {})
+                except Exception:
+                    item["summary"] = "Delegated work reached a terminal state."
+                item["summaryPublic"] = True
+            by_id[delegation_id] = item
+        try:
+            from tools.async_delegation import list_async_delegations
+            for row in list_async_delegations():
+                if str(row.get("parent_session_id") or "") != session_id:
+                    continue
+                delegation_id = str(row.get("delegation_id") or row.get("id") or "")
+                if not delegation_id:
+                    continue
+                state = _normalized_state(row.get("status"))
+                existing = by_id.get(delegation_id, {})
+                durable_terminal = existing.get("state") in {
+                    "completed", "failed", "interrupted",
+                }
+                existing.update({
+                    "id": delegation_id,
+                    "state": existing.get("state") if durable_terminal else (
+                        state if state in {"running", "finalizing", "completed", "failed", "interrupted"} else "unknown"
+                    ),
+                    "createdAt": existing.get("createdAt") or row.get("started_at"),
+                    "updatedAt": row.get("completed_at") or row.get("started_at"),
+                    "completedAt": row.get("completed_at"),
+                    "goal": existing.get("goal") or _safe_goal(row.get("goal")) or "Delegated task",
+                    "goalPublic": True,
+                    "parentSessionId": session_id,
+                })
+                created_at = existing.get("createdAt")
+                completed_at = existing.get("completedAt")
+                existing["elapsedSeconds"] = (
+                    round(max(0.0, float((completed_at or now) - created_at)), 2)
+                    if isinstance(created_at, (int, float)) else None
+                )
+                existing.setdefault("toolCallCount", None)
+                existing.setdefault("parentRunId", None)
+                by_id[delegation_id] = existing
+        except Exception:
+            pass
+        data = sorted(by_id.values(), key=lambda item: (item.get("createdAt") or 0, item["id"]))
+        return web.json_response({
+            "object": "list", "sessionId": session_id, "data": data,
+            "activeCount": sum(item["state"] in {"running", "finalizing"} for item in data),
         })
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
@@ -3213,14 +3736,16 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-        )
+        async with self._context_lock(session_id):
+            history = self._conversation_history_for_session(session_id)
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                settings_session_id=session_id,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -3300,16 +3825,18 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    user_message=user_message,
-                    conversation_history=history,
-                    ephemeral_system_prompt=system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress,
-                    gateway_session_key=gateway_session_key,
-                )
+                async with self._context_lock(session_id):
+                    history = self._conversation_history_for_session(session_id)
+                    result, usage = await self._run_agent(
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_delta,
+                        tool_progress_callback=_tool_progress,
+                        gateway_session_key=gateway_session_key,
+                        settings_session_id=session_id,
+                    )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
@@ -5361,6 +5888,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         synthesize_only: bool = False,
+        settings_session_id: Optional[str] = None,
+        tracked_run_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5412,9 +5941,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                         synthesize_only=synthesize_only,
+                        settings_session_id=settings_session_id,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if tracked_run_id:
+                        self._active_run_agents[tracked_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,
@@ -5438,10 +5970,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
+        active_session_id = settings_session_id or session_id
+        if active_session_id:
+            self._active_session_runs[active_session_id] = (
+                self._active_session_runs.get(active_session_id, 0) + 1
+            )
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            if active_session_id:
+                remaining = self._active_session_runs.get(active_session_id, 1) - 1
+                if remaining > 0:
+                    self._active_session_runs[active_session_id] = remaining
+                else:
+                    self._active_session_runs.pop(active_session_id, None)
+            if tracked_run_id:
+                self._active_run_agents.pop(tracked_run_id, None)
 
     # ------------------------------------------------------------------
     # /v1/uploads and run artifact delivery
@@ -6445,7 +6990,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # passing storage rows (ids, timestamps, internal columns) to an agent.
                 conversation_history = db.get_messages_as_conversation(session_id)
         idem_key = request.headers.get("Idempotency-Key", "").strip()
-        if idem_key:
+        # Signed synthesize-only continuations were already fenced above by
+        # claim_anton_synthesis() using their required delivery-scoped key.
+        # Do not feed that private control-plane key into the ordinary public
+        # session-key idempotency contract as well.
+        if idem_key and continuation_idempotency_key is None:
             if len(idem_key) > 256 or db is None or not gateway_session_key:
                 return web.json_response(_openai_error("Idempotency-Key requires a valid session scope", code="invalid_idempotency_key"), status=400)
             outcome, previous_run = db.reserve_api_run_idempotency(
@@ -6712,6 +7261,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                         synthesize_only=synthesize_only,
+                        settings_session_id=logical_session_id or session_id,
                     )
                 agent._anton_run_id = run_id
                 self._active_run_agents[run_id] = agent
@@ -7101,6 +7651,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         resolve_gateway_clarify(clarification_id, "")
                     except Exception:
                         pass
+                terminal = self._run_statuses.get(run_id, {}).get("status")
+                if terminal in {"completed", "failed", "cancelled", "stopped"}:
+                    self._schedule_api_queue_dispatch(logical_session_id or session_id)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -7357,6 +7910,344 @@ class APIServerAdapter(BasePlatformAdapter):
             "clarification_id": clarification_id,
             "resolved": True,
         })
+
+    def _run_control_record(self, run_id: str) -> Optional[Dict[str, Any]]:
+        status = self._run_statuses.get(run_id)
+        if status is not None:
+            return status
+        db = self._ensure_session_db()
+        persisted = db.get_api_run(run_id) if db is not None else None
+        if persisted is None:
+            return None
+        return {
+            "run_id": run_id,
+            "status": persisted.get("status"),
+            "logical_session_id": persisted.get("logical_session_id"),
+            "effective_session_id": persisted.get("effective_session_id"),
+            "context_revision": persisted.get("revision", 0),
+        }
+
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — enqueue text on a live agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        status = self._run_control_record(run_id)
+        if status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404,
+            )
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if set(body) != {"text"} or not isinstance(body.get("text"), str):
+            return web.json_response(
+                _openai_error("Expected strict JSON object with text", code="invalid_steer"), status=400,
+            )
+        text = body["text"].strip()
+        if not text or len(text) > 12_000:
+            return web.json_response(
+                _openai_error("text must be non-empty and at most 12000 characters", code="invalid_steer"), status=400,
+            )
+        if status.get("status") != "running":
+            return web.json_response(
+                _openai_error("Run is not accepting steering input", code="steer_not_active"), status=409,
+            )
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            return web.json_response(
+                _openai_error("Run has no active steerable agent", code="steer_not_active"), status=409,
+            )
+        try:
+            accepted = bool(agent.steer(text))
+        except Exception:
+            accepted = False
+        if not accepted:
+            return web.json_response({
+                "object": "hermes.run.steer", "runId": run_id,
+                "state": "rejected", "accepted": False, "applied": False,
+            }, status=409)
+        return web.json_response({
+            "object": "hermes.run.steer", "runId": run_id,
+            # AIAgent.steer() appends to a thread-safe pending queue.  It is
+            # truthful to report acceptance now, not application to a model call.
+            "state": "accepted", "accepted": True, "applied": False,
+        }, status=202)
+
+    @staticmethod
+    def _public_queue_item(item: Dict[str, Any], position: Optional[int] = None) -> Dict[str, Any]:
+        content = item.get("content")
+        if isinstance(content, str):
+            preview = content.strip()[:160]
+        else:
+            preview = ""
+        payload = {
+            "object": "hermes.run.queue_item",
+            "itemId": item.get("item_id"),
+            "parentRunId": item.get("parent_run_id"),
+            "state": item.get("state"),
+            "textPreview": preview,
+            "attachmentIds": item.get("attachment_ids") or [],
+            "createdAt": item.get("created_at"),
+            "updatedAt": item.get("updated_at"),
+        }
+        if position is not None:
+            payload["position"] = position
+        if item.get("state") not in {"queued", "cancelled"}:
+            payload["dispatchRunId"] = item.get("dispatch_run_id")
+        return payload
+
+    async def _handle_queue_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/queue — durably queue a follow-up turn."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        parent_run_id = request.match_info["run_id"]
+        parent = self._run_control_record(parent_run_id)
+        if parent is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {parent_run_id}", code="run_not_found"), status=404,
+            )
+        if parent.get("status") not in self._SESSION_MUTATION_ACTIVE_STATES:
+            return web.json_response(
+                _openai_error("Follow-ups can only be queued while the parent run is active", code="queue_parent_not_active"), status=409,
+            )
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if set(body) - {"content", "attachments"} or "content" not in body:
+            return web.json_response(
+                _openai_error("Expected strict JSON with content and optional attachments", code="invalid_queue_item"), status=400,
+            )
+        try:
+            content = _normalize_multimodal_content(body.get("content"))
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="content")
+        attachment_ids = body.get("attachments", [])
+        if not _content_has_visible_payload(content) and not attachment_ids:
+            return web.json_response(
+                _openai_error("Queued content must not be empty", code="invalid_queue_item"), status=400,
+            )
+        session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        records = []
+        try:
+            if attachment_ids:
+                if not session_key:
+                    raise RunFileError("X-Hermes-Session-Key is required for attachments", "missing_session_key", 400)
+                records = self._run_files.resolve_uploads(attachment_ids, owner_digest(session_key))
+            elif not isinstance(attachment_ids, list):
+                raise RunFileError("attachments must be an array of file IDs", "invalid_attachments", 400)
+        except RunFileError as exc:
+            return self._run_file_error(exc)
+
+        item_id = f"queue_{uuid.uuid4().hex}"
+        dispatch_run_id = f"run_{uuid.uuid4().hex}"
+        try:
+            snapshots = self._run_files.snapshot_queue_uploads(item_id, records)
+        except Exception:
+            logger.exception("[api_server] queue attachment snapshot failed")
+            return web.json_response(
+                _openai_error("Queued attachments could not be persisted", code="queue_persist_failed"), status=500,
+            )
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key is not None and (not idempotency_key or len(idempotency_key) > 256):
+            self._run_files.delete_queue_snapshot(item_id)
+            return web.json_response(
+                _openai_error("Invalid Idempotency-Key", code="invalid_idempotency_key"), status=400,
+            )
+        logical_id = str(parent.get("logical_session_id") or parent.get("session_id") or "")
+        digest = hashlib.sha256(json.dumps(
+            {"content": content, "attachments": attachment_ids},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        try:
+            outcome, item = self._ensure_session_db().reserve_api_queue_item(
+                item_id=item_id,
+                parent_run_id=parent_run_id,
+                logical_session_id=logical_id,
+                session_key=session_key or "",
+                content=content,
+                attachment_ids=attachment_ids,
+                attachment_snapshot=snapshots,
+                dispatch_run_id=dispatch_run_id,
+                idempotency_scope=session_key or logical_id,
+                idempotency_key=idempotency_key,
+                body_digest=digest if idempotency_key is not None else None,
+            )
+        except Exception:
+            self._run_files.delete_queue_snapshot(item_id)
+            logger.exception("[api_server] durable queue persistence failed")
+            return web.json_response(
+                _openai_error("Queue item could not be persisted", code="queue_persist_failed"), status=500,
+            )
+        if outcome != "created":
+            self._run_files.delete_queue_snapshot(item_id)
+        if outcome == "conflict":
+            return web.json_response(
+                _openai_error("Idempotency key request conflict", code="idempotency_conflict"), status=409,
+            )
+        queued = [row for row in self._ensure_session_db().list_api_queue_items(logical_id) if row.get("state") == "queued"]
+        position = next((index + 1 for index, row in enumerate(queued) if row["item_id"] == item["item_id"]), None)
+        latest_parent = self._run_control_record(parent_run_id)
+        if latest_parent and latest_parent.get("status") in {"completed", "failed", "cancelled", "stopped"}:
+            self._schedule_api_queue_dispatch(logical_id)
+        return web.json_response(
+            self._public_queue_item(item, position), status=202 if outcome == "created" else 200,
+        )
+
+    def _queue_parent_and_items(self, run_id: str) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        parent = self._run_control_record(run_id)
+        if parent is None:
+            return None, []
+        logical_id = str(parent.get("logical_session_id") or parent.get("session_id") or "")
+        return parent, self._ensure_session_db().list_api_queue_items(logical_id)
+
+    async def _handle_list_run_queue(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        parent, items = self._queue_parent_and_items(run_id)
+        if parent is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404,
+            )
+        queued_position = 0
+        data = []
+        for item in items:
+            position = None
+            if item.get("state") == "queued":
+                queued_position += 1
+                position = queued_position
+            data.append(self._public_queue_item(item, position))
+        return web.json_response({"object": "list", "data": data})
+
+    async def _handle_cancel_run_queue_item(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        parent = self._run_control_record(request.match_info["run_id"])
+        if parent is None:
+            return web.json_response(
+                _openai_error("Run not found", code="run_not_found"), status=404,
+            )
+        logical_id = str(parent.get("logical_session_id") or parent.get("session_id") or "")
+        item_id = request.match_info["item_id"]
+        outcome = self._ensure_session_db().cancel_api_queue_item(logical_id, item_id)
+        if outcome == "missing":
+            return web.json_response(
+                _openai_error("Queue item not found", code="queue_item_not_found"), status=404,
+            )
+        if outcome == "conflict":
+            return web.json_response(
+                _openai_error("Queue item is already dispatching or terminal", code="queue_item_not_cancellable"), status=409,
+            )
+        self._run_files.delete_queue_snapshot(item_id)
+        item = self._ensure_session_db().get_api_queue_item(item_id)
+        return web.json_response(self._public_queue_item(item or {"item_id": item_id, "state": "cancelled"}))
+
+    def _schedule_api_queue_dispatch(self, logical_id: str) -> None:
+        if not logical_id:
+            return
+        current = self._queue_dispatch_tasks.get(logical_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._drain_api_run_queue(logical_id))
+        self._queue_dispatch_tasks[logical_id] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _drain_api_run_queue(self, logical_id: str) -> None:
+        """Single deterministic coordinator for one logical session."""
+        lock = self._queue_locks.setdefault(logical_id, asyncio.Lock())
+        async with lock:
+            while True:
+                item = self._ensure_session_db().claim_next_api_queue_item(logical_id)
+                if item is None:
+                    return
+                await self._dispatch_api_queue_item(item)
+
+    async def _dispatch_api_queue_item(self, item: Dict[str, Any]) -> None:
+        db = self._ensure_session_db()
+        item_id = item["item_id"]
+        run_id = item["dispatch_run_id"]
+        logical_id = item["logical_session_id"]
+        context_lock = self._context_lock(logical_id)
+        self._active_run_tasks[run_id] = asyncio.current_task()
+        db.set_api_queue_item_state(item_id, "running")
+        try:
+            async with context_lock:
+                state = db.get_or_create_context_state(logical_id)
+                effective_id = state["effective_session_id"]
+                history = db.get_messages_as_conversation(effective_id)
+                content = self._run_files.queued_multimodal_parts(
+                    item_id, item.get("content"), item.get("attachment_snapshot"),
+                )
+                self._set_run_status(
+                    run_id, "running", session_id=effective_id,
+                    logical_session_id=logical_id, effective_session_id=effective_id,
+                    context_revision=state["revision"], queued_item_id=item_id,
+                )
+                result, usage = await self._run_agent(
+                    user_message=content,
+                    conversation_history=history,
+                    session_id=effective_id,
+                    gateway_session_key=item.get("session_key") or logical_id,
+                    settings_session_id=logical_id,
+                    tracked_run_id=run_id,
+                )
+                resulting_id = result.get("session_id", effective_id) if isinstance(result, dict) else effective_id
+                advanced = db.advance_context_state(
+                    logical_id,
+                    expected_revision=int(state["revision"]),
+                    effective_session_id=resulting_id,
+                    event_type="context.updated",
+                )
+                if advanced is None:
+                    raise RuntimeError("queued context revision changed")
+                if isinstance(result, dict) and result.get("failed"):
+                    raise RuntimeError("queued agent run failed")
+                output = result.get("final_response", "") if isinstance(result, dict) else ""
+                db.finish_api_queue_dispatch(
+                    item_id,
+                    run_id=run_id,
+                    logical_session_id=logical_id,
+                    effective_session_id=resulting_id,
+                    revision=int(advanced["revision"]),
+                    status="completed",
+                )
+                self._set_run_status(
+                    run_id, "completed", output=output, usage=usage,
+                    effective_session_id=resulting_id,
+                    context_revision=advanced["revision"],
+                )
+        except asyncio.CancelledError:
+            db.set_api_queue_item_state(item_id, "queued")
+            raise
+        except Exception:
+            logger.exception("[api_server] queued run dispatch failed for %s", item_id)
+            current = self._run_statuses.get(run_id, {})
+            db.finish_api_queue_dispatch(
+                item_id,
+                run_id=run_id,
+                logical_session_id=logical_id,
+                effective_session_id=str(current.get("effective_session_id") or logical_id),
+                revision=int(current.get("context_revision") or 0),
+                status="failed",
+            )
+            self._set_run_status(run_id, "failed", error="Queued run failed")
+        finally:
+            self._active_run_agents.pop(run_id, None)
+            self._active_run_tasks.pop(run_id, None)
+            if db.get_api_queue_item(item_id).get("state") in {"completed", "failed", "cancelled"}:
+                self._run_files.delete_queue_snapshot(item_id)
+
+    async def _recover_api_run_queue(self) -> None:
+        for logical_id in self._ensure_session_db().recover_api_run_queue():
+            self._schedule_api_queue_dispatch(logical_id)
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
@@ -7623,6 +8514,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
 
             self._mark_connected()
+            # Reclaim queue rows only after this process can serve their
+            # poll/status endpoints. Recovery is deterministic per session.
+            await self._recover_api_run_queue()
             # The recovery owner exists only after aiohttp's runner and site
             # are live; disconnect() owns cancellation for this exact task.
             if _anton_detached_completion_sink_ready() and self._detached_delivery_task is None:
