@@ -1240,7 +1240,7 @@ class TestAntonOriginV2Runs:
                     while adapter._active_run_tasks:
                         await asyncio.sleep(0.01)
                     status = await (await cli.get(f"/v1/runs/{run_id}")).json()
-                    stored_events = list(adapter._run_streams[run_id]._queue)
+                    stored_events = adapter._run_streams[run_id].events_after(0)
                     wire = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
 
         public_projection = "\n".join((json.dumps(status), json.dumps(stored_events), wire, caplog.text))
@@ -1316,7 +1316,7 @@ class TestAntonOriginV2Runs:
                     while adapter._active_run_tasks:
                         await asyncio.sleep(0.01)
                     status = await (await cli.get(f"/v1/runs/{run_id}")).json()
-                    event_store = list(adapter._run_streams[run_id]._queue)
+                    event_store = adapter._run_streams[run_id].events_after(0)
                     wire = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
 
         assert status["status"] == "failed"

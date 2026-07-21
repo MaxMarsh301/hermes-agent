@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- GET  /api/sessions/{session_id}/runtime-status — safe runtime/status summary
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -2007,6 +2008,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/runtime-status", self._handle_session_runtime_status),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -2572,6 +2574,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_runtime_status": {"method": "GET", "path": "/api/sessions/{session_id}/runtime-status"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -2734,6 +2737,212 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    @staticmethod
+    def _runtime_status_model_config(session: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse only the persisted model metadata needed for status fields.
+
+        ``model_config`` may contain provider URLs and credentials, so it must
+        never cross this API boundary.  This helper is deliberately private and
+        returns an empty mapping for malformed legacy rows.
+        """
+        raw = session.get("model_config")
+        if not isinstance(raw, str) or not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _runtime_status_agent_for_session(self, session_id: str) -> Any:
+        """Return a currently-running Runs API agent for this session, if any."""
+        for run_id, agent in tuple(self._active_run_agents.items()):
+            status = self._run_statuses.get(run_id, {})
+            if status.get("session_id") == session_id:
+                return agent
+        return None
+
+    def _runtime_status_background_task_count(self, session_id: str) -> Optional[int]:
+        """Count live async delegations owned by this durable session.
+
+        The in-memory delegation registry is the only state that can identify
+        a still-running task without reporting completed historical work.  If
+        it is unavailable, return ``None`` rather than a process-wide count.
+        """
+        try:
+            from tools.async_delegation import _records, _records_lock
+            with _records_lock:
+                return sum(
+                    1
+                    for record in _records.values()
+                    if record.get("status") in {"running", "finalizing"}
+                    and str(record.get("parent_session_id") or "") == session_id
+                )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _runtime_status_positive_context_length(value: Any) -> Optional[int]:
+        """Return a validated context limit without coercing untrusted config."""
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    async def _runtime_status_context_limit(
+        self, model: Any, configured_model: Any, persisted_config: Dict[str, Any], runtime_config: Dict[str, Any],
+    ) -> Optional[int]:
+        """Resolve a persisted session's context limit without inventing one.
+
+        A live compressor is authoritative, but it disappears when a run ends.
+        Consult session-specific persisted configuration and model metadata for
+        the session's effective model before considering a global override.  A
+        global ``model.context_length`` applies only when its model identity
+        matches this session's configured model; otherwise it could falsely
+        describe a different model's context window.  The model metadata
+        resolver has a generic fallback; that fallback is deliberately rejected
+        here because an unknown model must remain unknown in this API.
+        """
+        for candidate in (
+            persisted_config.get("context_length"),
+            runtime_config.get("context_length"),
+        ):
+            if (context_limit := self._runtime_status_positive_context_length(candidate)) is not None:
+                return context_limit
+
+        gateway_model_config: Dict[str, Any] = {}
+        try:
+            # Keep this aligned with gateway/slash_commands.py's /status
+            # fallback while retaining the configured session model below.
+            from gateway.run import _load_gateway_config
+            gateway_config = _load_gateway_config()
+            candidate = gateway_config.get("model", {}) if isinstance(gateway_config, dict) else {}
+            gateway_model_config = candidate if isinstance(candidate, dict) else {}
+        except Exception:
+            pass
+        if not isinstance(model, str) or not model.strip():
+            return None
+        global_model = gateway_model_config.get("default") or gateway_model_config.get("model")
+        global_context_limit = self._runtime_status_positive_context_length(
+            gateway_model_config.get("context_length")
+        )
+        # The explicit global override is authoritative for sessions that are
+        # still using that configured model.  Resolve it before model metadata:
+        # provider catalogs can advertise the backend's physical window (for
+        # example 1.05M) while Hermes is intentionally capped lower (272K).
+        # Do not apply the configured model's cap after a fallback switched the
+        # session to a different effective model.
+        if (
+            global_context_limit is not None
+            and isinstance(global_model, str)
+            and isinstance(configured_model, str)
+            and global_model.strip() == configured_model.strip() == model.strip()
+        ):
+            return global_context_limit
+        provider = persisted_config.get("provider") or runtime_config.get("provider") or gateway_model_config.get("provider") or ""
+        try:
+            from agent.model_metadata import DEFAULT_FALLBACK_CONTEXT, get_model_context_length
+            resolved = await asyncio.to_thread(
+                get_model_context_length, model, provider=provider if isinstance(provider, str) else "",
+            )
+        except Exception:
+            return None
+        # get_model_context_length() returns this value for failed/unknown
+        # lookups. Reporting it would make an estimate look authoritative.
+        if resolved != DEFAULT_FALLBACK_CONTEXT:
+            if (context_limit := self._runtime_status_positive_context_length(resolved)) is not None:
+                return context_limit
+
+        return None
+
+    async def _handle_session_runtime_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/runtime-status.
+
+        Exposes a deliberately narrow status projection for control-plane UIs.
+        It never serializes an agent, transcript, model_config, prompts, tool
+        payloads, provider errors, credentials, or filesystem metadata.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        session, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = self._ensure_session_db()
+        messages = db.get_messages(session_id) if db is not None else []
+        config = self._runtime_status_model_config(session)
+        runtime = config.get("gateway_runtime")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        agent = self._runtime_status_agent_for_session(session_id)
+
+        # Newer gateway rows retain the configured model in this narrow,
+        # non-secret runtime marker before ``session.model`` is overwritten by
+        # a fallback.  Legacy rows lack it, so their persisted model is the
+        # best truthful value available for both configured/effective fields.
+        configured_model = runtime.get("configured_model") or session.get("model") or None
+        effective_model = getattr(agent, "model", None) or session.get("model") or configured_model
+        fallback_active = (
+            bool(getattr(agent, "_fallback_activated", False))
+            if agent is not None
+            else (bool(runtime["fallback_active"]) if "fallback_active" in runtime else None)
+        )
+        reasoning_config = getattr(agent, "reasoning_config", None) if agent is not None else config.get("reasoning_config")
+        reasoning_effort = None
+        if isinstance(reasoning_config, dict):
+            reasoning_effort = "none" if reasoning_config.get("enabled") is False else (reasoning_config.get("effort") or None)
+        service_tier = getattr(agent, "service_tier", None) if agent is not None else config.get("service_tier")
+        fast_mode = (service_tier == "priority") if service_tier is not None else None
+
+        compressor = getattr(agent, "context_compressor", None) if agent is not None else None
+        measured_context = getattr(compressor, "last_prompt_tokens", None) if compressor is not None else None
+        context_limit = getattr(compressor, "context_length", None) if compressor is not None else None
+        if self._runtime_status_positive_context_length(context_limit) is None:
+            context_limit = await self._runtime_status_context_limit(
+                effective_model, configured_model, config, runtime,
+            )
+        if isinstance(measured_context, int) and measured_context > 0:
+            context_used = measured_context
+            context_measurement = "actual"
+        else:
+            try:
+                from agent.model_metadata import estimate_messages_tokens_rough
+                context_used = estimate_messages_tokens_rough(messages) if messages else None
+            except Exception:
+                context_used = None
+            context_measurement = "estimated" if context_used is not None else None
+        context_limit = self._runtime_status_positive_context_length(context_limit)
+        context_percent = (
+            max(0, min(100, round(context_used / context_limit * 100)))
+            if context_used is not None and context_limit else None
+        )
+
+        active_states = {"queued", "running", "waiting_for_approval", "waiting_for_clarification"}
+        active_runs = [
+            status for status in self._run_statuses.values()
+            if status.get("session_id") == session_id and status.get("status") in active_states
+        ]
+        active_run_state = max(active_runs, key=lambda status: status.get("updated_at", 0)).get("status") if active_runs else None
+        timestamps = [message.get("timestamp") for message in messages if isinstance(message.get("timestamp"), (int, float))]
+        updated_at = max(timestamps) if timestamps else (session.get("ended_at") or session.get("started_at"))
+
+        return web.json_response({
+            "sessionId": session_id,
+            "configuredModel": configured_model,
+            "effectiveModel": effective_model,
+            "fallbackActive": fallback_active,
+            "reasoningEffort": reasoning_effort,
+            "fastMode": fast_mode,
+            "contextUsedTokens": context_used,
+            "contextLimitTokens": context_limit,
+            "contextPercent": context_percent,
+            "contextMeasurement": context_measurement,
+            "inputTokens": session.get("input_tokens"),
+            "outputTokens": session.get("output_tokens"),
+            "activeRunState": active_run_state,
+            "backgroundTaskCount": self._runtime_status_background_task_count(session_id),
+            "lastCompressedAt": None,
+            "updatedAt": updated_at,
+        })
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
@@ -2882,6 +3091,22 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        allowed = {"id", "session_id", "title", "preserve_source"}
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported fork fields: {', '.join(unknown)}",
+                    code="unsupported_fork_field",
+                ),
+                status=400,
+            )
+        preserve_source = body.get("preserve_source", False)
+        if not isinstance(preserve_source, bool):
+            return web.json_response(
+                _openai_error("preserve_source must be a boolean", code="invalid_preserve_source"),
+                status=400,
+            )
         db = self._ensure_session_db()
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
@@ -2889,20 +3114,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if db.get_session(fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        db.end_session(source_id, "branched")
-        db.create_session(
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
-        )
-        messages = db.get_messages(source_id)
-        db.replace_messages(fork_id, messages)
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
@@ -2910,10 +3121,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 title = db.get_next_title_in_lineage(base)
             except Exception:
                 title = f"{base} fork"
+
+        # CLI branching ends the source session. Product UIs can explicitly keep
+        # the source live while creating a sibling view of its current state.
+        # Build the child completely before mutating the source so invalid input
+        # cannot leave either side half-transitioned.
+        db.create_session(
+            fork_id,
+            "api_server",
+            model=source.get("model"),
+            system_prompt=source.get("system_prompt"),
+            parent_session_id=source_id,
+        )
         try:
+            messages = db.get_messages(source_id)
+            db.replace_messages(fork_id, messages)
             db.set_session_title(fork_id, str(title))
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
+            db.delete_session(fork_id)
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+        except Exception:
+            db.delete_session(fork_id)
+            raise
+        if not preserve_source:
+            db.end_session(source_id, "branched")
         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
@@ -6331,11 +6562,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         if synthesize_only
                         else _redact_api_error_text(result.get("error") or "agent run failed")
                     )
-                    self._emit_run_event(run_id, {
+                    failure_event = {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                    })
+                    }
+                    if synthesize_only:
+                        failure_event["error"] = _SYNTHESIS_PRIVATE_OUTPUT_ERROR
+                    self._emit_run_event(run_id, failure_event)
                     self._set_run_status(
                         run_id,
                         "failed",
@@ -6451,11 +6685,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     error=error_msg,
                     last_event="run.failed",
                 )
-                self._emit_run_event(run_id, {
+                failure_event = {
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                })
+                }
+                # Ordinary provider errors stay status-only and redacted. Private
+                # synthesis publishes only the fixed contract literal expected by
+                # the signed continuation consumer, never provider/request text.
+                if synthesize_only:
+                    failure_event["error"] = _SYNTHESIS_PRIVATE_OUTPUT_ERROR
+                self._emit_run_event(run_id, failure_event)
             finally:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()
