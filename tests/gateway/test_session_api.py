@@ -124,7 +124,9 @@ async def test_session_runtime_status_is_safe_and_reports_actual_context(adapter
     assert set(payload) == {
         "sessionId", "configuredModel", "effectiveModel", "fallbackActive", "reasoningEffort", "fastMode",
         "contextUsedTokens", "contextLimitTokens", "contextPercent", "contextMeasurement", "inputTokens",
-        "outputTokens", "activeRunState", "backgroundTaskCount", "lastCompressedAt", "updatedAt",
+        "outputTokens", "activeRunState", "backgroundTaskCount", "contextRevision", "compressionCount",
+        "compressionState", "compressionOperationId", "lastCompressedAt", "updatedAt",
+        "lastCompression",
     }
     assert payload["sessionId"] == session_id
     assert payload["configuredModel"] == "configured-model"
@@ -136,6 +138,11 @@ async def test_session_runtime_status_is_safe_and_reports_actual_context(adapter
     assert payload["contextLimitTokens"] == 400
     assert payload["contextPercent"] == 30
     assert payload["contextMeasurement"] == "actual"
+    assert payload["contextRevision"] == 0
+    assert payload["compressionCount"] == 0
+    assert payload["compressionState"] is None
+    assert payload["compressionOperationId"] is None
+    assert payload["lastCompression"] is None
     assert payload["activeRunState"] == "running"
     assert payload["lastCompressedAt"] is None
     assert "secret" not in str(payload)

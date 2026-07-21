@@ -217,11 +217,37 @@ class TestSessionCompressEvent:
             )
 
             compress_events = [e for e in events if e[0] == "session:compress"]
+            started_events = [e for e in events if e[0] == "session:compress_started"]
+            assert len(started_events) == 1
             assert compress_events, f"session:compress not emitted, got {events!r}"
             _, ctx = compress_events[-1]
             assert ctx["session_id"] == agent.session_id
             assert ctx["old_session_id"] == original_sid
             assert ctx["compression_count"] == 1
+            assert ctx["operation_id"] == started_events[0][1]["operation_id"]
+            assert ctx["operation_id"].startswith("ctxop_")
+            assert isinstance(ctx["duration"], float)
+
+    def test_failed_event_emitted_when_compressor_aborts(self):
+        from hermes_state import SessionDB
+
+        events = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db, event_callback=lambda et, ctx: events.append((et, ctx)))
+            compressor = self._stub_compressor()
+            compressor._last_compress_aborted = True
+            compressor.compress.return_value = [{"role": "user", "content": "unchanged"}]
+            agent.context_compressor = compressor
+
+            agent._compress_context([{"role": "user", "content": "m"}], "sys", approx_tokens=100)
+
+            started = [payload for name, payload in events if name == "session:compress_started"]
+            failed = [payload for name, payload in events if name == "session:compress_failed"]
+            assert len(started) == 1
+            assert len(failed) == 1
+            assert failed[0]["operation_id"] == started[0]["operation_id"]
+            assert failed[0]["reason"] == "summary_unavailable"
 
     def test_no_callback_is_safe(self):
         """Compression must work when no event_callback is wired."""
