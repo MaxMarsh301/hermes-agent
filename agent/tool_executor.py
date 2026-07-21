@@ -189,7 +189,7 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
 
 def _reject_restricted_tool_calls(agent, tool_calls, messages: list) -> bool:
     """Fail closed before middleware, hooks, or any tool implementation runs."""
-    if not getattr(agent, "restricted_execution", False):
+    if getattr(agent, "restricted_execution", False) is not True:
         return False
     for tool_call in tool_calls:
         name = getattr(getattr(tool_call, "function", None), "name", "tool")
