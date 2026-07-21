@@ -32,6 +32,7 @@ import inspect
 import logging
 import os
 import tempfile
+import time
 import uuid
 import threading
 from datetime import datetime
@@ -700,6 +701,47 @@ def compress_context(
                 _lock_refresh_interval,
             ).start()
 
+    _compression_operation_id = f"ctxop_{uuid.uuid4().hex}"
+    _compression_started_at = time.monotonic()
+    _compression_lifecycle_terminal = False
+    agent._last_compression_operation_id = _compression_operation_id
+    agent._last_compression_duration = None
+
+    def _emit_compression_lifecycle(name: str, **payload: Any) -> None:
+        callback = getattr(agent, "event_callback", None)
+        if not callable(callback):
+            return
+        event = {
+            "platform": getattr(agent, "platform", None) or "",
+            "session_id": getattr(agent, "session_id", None) or _lock_sid,
+            "operation_id": _compression_operation_id,
+            **payload,
+        }
+        try:
+            callback(name, event)
+        except Exception as exc:
+            logger.debug("event_callback error on %s: %s", name, exc)
+
+    def _fail_compression_lifecycle(reason: str) -> None:
+        nonlocal _compression_lifecycle_terminal
+        if _compression_lifecycle_terminal:
+            return
+        _compression_lifecycle_terminal = True
+        agent._last_compression_duration = round(
+            max(0.0, time.monotonic() - _compression_started_at), 3
+        )
+        _emit_compression_lifecycle(
+            "session:compress_failed",
+            reason=reason,
+            duration=agent._last_compression_duration,
+        )
+
+    _emit_compression_lifecycle(
+        "session:compress_started",
+        reason="manual" if force else "threshold",
+        before_usage=approx_tokens,
+    )
+
     def _release_lock() -> None:
         """Release the lock keyed on the OLD session_id (before rotation)."""
         if _lock_refresher is not None:
@@ -725,11 +767,13 @@ def compress_context(
         try:
             compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
         except BaseException:
+            _fail_compression_lifecycle("compressor_error")
             _release_lock()
             raise
     except BaseException:
         # ANY exception during compress() must release the lock so the
         # session isn't permanently blocked from future compression.
+        _fail_compression_lifecycle("compressor_error")
         _release_lock()
         raise
 
@@ -750,6 +794,7 @@ def compress_context(
     # session has logically ended), and let auto-compress callers detect
     # the no-op via len(returned) == len(input).
     if getattr(agent.context_compressor, "_last_compress_aborted", False):
+        _fail_compression_lifecycle("summary_unavailable")
         try:
             _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
             if getattr(agent, "_last_compression_summary_warning", None) != _err:
@@ -770,6 +815,7 @@ def compress_context(
     # progress. Do not rotate/rewrite the session or arm post-compression
     # deferral in that case; its own anti-thrash counter records the no-op.
     if compressed is messages:
+        _fail_compression_lifecycle("no_progress")
         logger.info(
             "Compression made no progress (session=%s) — skipping boundary rewrite.",
             agent.session_id or "none",
@@ -1038,6 +1084,10 @@ def compress_context(
         # the completed old session before its details are lost. In in-place mode
         # there is no old id (same session); ``in_place=True`` tells hooks the
         # transcript was compacted on the same id rather than rotated.
+        _compression_lifecycle_terminal = True
+        agent._last_compression_duration = round(
+            max(0.0, time.monotonic() - _compression_started_at), 3
+        )
         if getattr(agent, "event_callback", None):
             try:
                 agent.event_callback("session:compress", {
@@ -1046,6 +1096,8 @@ def compress_context(
                     "old_session_id": _old_sid or "",
                     "in_place": in_place,
                     "compression_count": agent.context_compressor.compression_count,
+                    "operation_id": _compression_operation_id,
+                    "duration": agent._last_compression_duration,
                 })
             except Exception as e:
                 logger.debug("event_callback error on session:compress: %s", e)
@@ -1102,6 +1154,8 @@ def compress_context(
         )
         return compressed, new_system_prompt
     finally:
+        if not _compression_lifecycle_terminal:
+            _fail_compression_lifecycle("boundary_error")
         # Release the lock on the OLD session_id only AFTER rotation completed
         # and all post-rotation bookkeeping (memory manager, context engine,
         # file dedup) ran. A concurrent path that wakes up the moment we

@@ -1474,6 +1474,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Logical-session domains serialize history load -> agent turn -> pointer
+        # reconciliation. SQLite remains the cross-restart source of truth.
+        self._context_locks: Dict[str, asyncio.Lock] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -2009,6 +2012,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("GET", "/api/sessions/{session_id}/runtime-status", self._handle_session_runtime_status),
+            ("GET", "/api/sessions/{session_id}/context-state", self._handle_context_state),
+            ("GET", "/api/sessions/{session_id}/context-events", self._handle_context_events),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -2868,6 +2873,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = self._ensure_session_db()
+        context_state = db.get_or_create_context_state(session_id) if db is not None else None
+        latest_context_event = db.latest_context_event(session_id) if db is not None else None
         messages = db.get_messages(session_id) if db is not None else []
         config = self._runtime_status_model_config(session)
         runtime = config.get("gateway_runtime")
@@ -2923,6 +2930,40 @@ class APIServerAdapter(BasePlatformAdapter):
         active_run_state = max(active_runs, key=lambda status: status.get("updated_at", 0)).get("status") if active_runs else None
         timestamps = [message.get("timestamp") for message in messages if isinstance(message.get("timestamp"), (int, float))]
         updated_at = max(timestamps) if timestamps else (session.get("ended_at") or session.get("started_at"))
+        compression_state = None
+        compression_operation_id = None
+        last_compression = None
+        if latest_context_event is not None:
+            latest_event_type = latest_context_event.get("event_type")
+            if isinstance(latest_event_type, str):
+                compression_state = {
+                    "session:compress_started": "running",
+                    "session:compress_failed": "failed",
+                    "session:compress": "idle",
+                }.get(latest_event_type)
+            try:
+                latest_telemetry = json.loads(latest_context_event.get("telemetry_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                latest_telemetry = {}
+            candidate_operation_id = latest_telemetry.get("operationId")
+            if isinstance(candidate_operation_id, str) and re.fullmatch(r"ctxop_[0-9a-f]{32}", candidate_operation_id):
+                compression_operation_id = candidate_operation_id
+            if latest_event_type == "session:compress":
+                safe_last: Dict[str, Any] = {}
+                for name in ("before", "after"):
+                    snapshot = latest_telemetry.get(name)
+                    if isinstance(snapshot, dict) and isinstance(snapshot.get("used"), int) and not isinstance(snapshot.get("used"), bool) and snapshot["used"] >= 0:
+                        safe_snapshot: Dict[str, Any] = {"used": snapshot["used"]}
+                        if isinstance(snapshot.get("limit"), int) and not isinstance(snapshot.get("limit"), bool) and snapshot["limit"] > 0:
+                            safe_snapshot["limit"] = snapshot["limit"]
+                        if snapshot.get("measurement") in {"actual", "estimated"}:
+                            safe_snapshot["measurement"] = snapshot["measurement"]
+                        safe_last[name] = safe_snapshot
+                duration = latest_telemetry.get("duration")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool) and 0 <= duration <= 86400:
+                    safe_last["duration"] = float(duration)
+                if safe_last:
+                    last_compression = safe_last
 
         return web.json_response({
             "sessionId": session_id,
@@ -2939,7 +2980,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "outputTokens": session.get("output_tokens"),
             "activeRunState": active_run_state,
             "backgroundTaskCount": self._runtime_status_background_task_count(session_id),
-            "lastCompressedAt": None,
+            "contextRevision": context_state.get("revision") if context_state else 0,
+            "compressionCount": context_state.get("compression_epoch") if context_state else 0,
+            "compressionState": compression_state,
+            "compressionOperationId": compression_operation_id,
+            "lastCompression": last_compression,
+            "lastCompressedAt": context_state.get("last_compressed_at") if context_state else None,
             "updatedAt": updated_at,
         })
 
@@ -5548,7 +5594,138 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        db = self._ensure_session_db()
+        if db is not None and current.get("logical_session_id"):
+            try:
+                db.save_api_run(run_id, current["logical_session_id"], current.get("effective_session_id") or current["logical_session_id"], int(current.get("context_revision", 0)), status)
+            except Exception:
+                logger.debug("Could not persist public run status", exc_info=True)
         return current
+
+    def _context_lock(self, logical_session_id: str) -> asyncio.Lock:
+        return self._context_locks.setdefault(logical_session_id, asyncio.Lock())
+
+    @staticmethod
+    def _context_turn_revision(expected: int, current: int, *, waited_for_lock: bool) -> Optional[int]:
+        """Accept a queued turn after the lock owner advanced the same session."""
+        if current == expected:
+            return current
+        if waited_for_lock and current > expected:
+            return current
+        return None
+
+    async def _post_run_compact(self, logical_session_id: str, expected_revision: int, agent: Any) -> None:
+        """Bounded, best-effort post-turn compaction in the same logical lock."""
+        compressor = getattr(agent, "context_compressor", None)
+        db = self._ensure_session_db()
+        if compressor is None or db is None:
+            return
+        lock = self._context_lock(logical_session_id)
+        async with lock:
+            state = db.get_or_create_context_state(logical_session_id)
+            if int(state["revision"]) != expected_revision:
+                return
+            messages = db.get_messages_as_conversation(state["effective_session_id"])
+            original_messages = [dict(message) for message in messages]
+            occupancy = self._safe_context_usage(getattr(compressor, "last_prompt_tokens", None))
+            if occupancy is None:
+                try:
+                    from agent.model_metadata import estimate_messages_tokens_rough
+                    occupancy = estimate_messages_tokens_rough(messages)
+                except Exception:
+                    return
+            should_compress = getattr(compressor, "should_compress", None)
+            if not callable(should_compress) or not should_compress(occupancy):
+                return
+            try:
+                compacted_messages, _ = await asyncio.wait_for(
+                    asyncio.to_thread(agent._compress_context, messages, "", approx_tokens=occupancy), timeout=30,
+                )
+            except Exception:
+                logger.debug("Post-run context compaction skipped", exc_info=True)
+                return
+            effective = getattr(agent, "session_id", None) or state["effective_session_id"]
+            active_messages = db.get_messages_as_conversation(effective)
+            try:
+                from agent.model_metadata import estimate_messages_tokens_rough
+                after_usage = estimate_messages_tokens_rough(active_messages)
+            except Exception:
+                after_usage = None
+            if active_messages == original_messages or not isinstance(after_usage, int) or after_usage >= occupancy:
+                return
+            telemetry: Dict[str, Any] = {"reason": "threshold", "measurement": "estimated", "runId": getattr(agent, "_anton_run_id", "")}
+            operation_id = getattr(agent, "_last_compression_operation_id", None)
+            if isinstance(operation_id, str) and re.fullmatch(r"ctxop_[0-9a-f]{32}", operation_id):
+                telemetry["operationId"] = operation_id
+            duration = getattr(agent, "_last_compression_duration", None)
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(float(duration)) and 0 <= float(duration) <= 86400:
+                telemetry["duration"] = round(float(duration), 3)
+            if occupancy is not None:
+                telemetry["before"] = {"used": occupancy, "measurement": "estimated"}
+            if isinstance(after_usage, int) and after_usage >= 0:
+                telemetry["after"] = {"used": after_usage, "measurement": "estimated"}
+            db.advance_context_state(logical_session_id, expected_revision=expected_revision, effective_session_id=effective, event_type="session:compress", compressed=True, telemetry=telemetry)
+
+    @staticmethod
+    def _public_context_state(state: Dict[str, Any]) -> Dict[str, Any]:
+        return {"logicalSessionId": state["logical_session_id"], "effectiveSessionId": state["effective_session_id"], "revision": state["revision"], "compressionEpoch": state["compression_epoch"], "lastCompressedAt": state["last_compressed_at"], "updatedAt": state["updated_at"]}
+
+    @staticmethod
+    def _safe_context_usage(value: Any) -> Optional[int]:
+        return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100_000_000 else None
+
+    async def _handle_context_state(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        state = db.get_or_create_context_state(request.match_info["session_id"])
+        return web.json_response(self._public_context_state(state))
+
+    async def _handle_context_events(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        try:
+            after = max(0, int(request.query.get("cursor", request.query.get("after", "0"))))
+            limit = min(200, max(1, int(request.query.get("limit", "100"))))
+        except ValueError:
+            return web.json_response(_openai_error("Invalid cursor", code="invalid_cursor"), status=400)
+        logical_session_id = request.match_info["session_id"]
+        minimum, maximum = db.context_event_bounds(logical_session_id)
+        retention_gap = minimum is not None and after > 0 and after < minimum - 1
+        events = db.list_context_events(logical_session_id, after=after, limit=limit)
+        state = db.get_or_create_context_state(logical_session_id)
+        data = []
+        for item in events:
+            try:
+                telemetry = json.loads(item.get("telemetry_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                telemetry = {}
+            event_name = {
+                "session:compress_started": "session.context.compression_started",
+                "session:compress_failed": "session.context.compression_failed",
+                "session:compress": "session.context.compressed",
+            }.get(item["event_type"], "session.runtime.updated")
+            public = {
+                "cursor": str(item["id"]),
+                "eventId": f"context-{item['id']}",
+                "event": event_name,
+                "type": item["event_type"],
+                "logicalSessionId": item["logical_session_id"],
+                "effectiveSessionId": item["effective_session_id"],
+                "contextRevision": item["revision"],
+                "compressionEpoch": int(item.get("compression_epoch", 0)),
+                "createdAt": item["created_at"],
+                **telemetry,
+            }
+            data.append(public)
+        return web.json_response({"object": "list", "data": data, "events": data, "nextCursor": data[-1]["cursor"] if data else str(after), "retentionGap": retention_gap, "retainedMinimumCursor": minimum, "retainedMaximumCursor": maximum})
 
     def _run_event_emitter(
         self, run_id: str, loop: Optional["asyncio.AbstractEventLoop"] = None,
@@ -6159,12 +6336,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        context = body.get("context")
+        context_mode = None
+        expected_revision = None
+        logical_session_id = None
+        if context is not None:
+            if not isinstance(context, dict) or set(context) - {"mode", "session_id", "expected_revision"}:
+                return web.json_response(_openai_error("Invalid context", code="invalid_context"), status=400)
+            context_mode = context.get("mode")
+            logical_session_id = context.get("session_id") or body.get("session_id")
+            expected_revision = context.get("expected_revision", 0 if context_mode == "bootstrap" else None)
+            if context_mode not in {"bootstrap", "session"}:
+                return web.json_response(_openai_error("context.mode must be bootstrap or session", code="invalid_context_mode"), status=400)
+            if not isinstance(logical_session_id, str) or not logical_session_id.strip() or not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision < 0:
+                return web.json_response(_openai_error("context.session_id and non-negative expected_revision are required", code="invalid_context_revision"), status=400)
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, str]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
+            if context_mode == "session":
+                return web.json_response(_openai_error("session context does not accept conversation_history", code="session_history_forbidden"), status=400)
             if not isinstance(raw_history, list):
                 return web.json_response(
                     _openai_error("'conversation_history' must be an array of message objects"),
@@ -6238,6 +6431,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 trusted_anton_origin = bind_parent_run(trusted_anton_origin, run_id)
             except Exception:
                 return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
+        db = self._ensure_session_db()
+        context_state = None
+        if context_mode:
+            if db is None:
+                return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+            context_state = db.get_or_create_context_state(logical_session_id, effective_session_id=session_id)
+            if int(context_state["revision"]) != expected_revision:
+                return web.json_response(_openai_error("Context revision conflict", code="context_revision_conflict"), status=409)
+            session_id = context_state["effective_session_id"]
+            if context_mode == "session" or (context_mode == "bootstrap" and expected_revision != 0):
+                # Restore the active Hermes conversation projection rather than
+                # passing storage rows (ids, timestamps, internal columns) to an agent.
+                conversation_history = db.get_messages_as_conversation(session_id)
+        idem_key = request.headers.get("Idempotency-Key", "").strip()
+        if idem_key:
+            if len(idem_key) > 256 or db is None or not gateway_session_key:
+                return web.json_response(_openai_error("Idempotency-Key requires a valid session scope", code="invalid_idempotency_key"), status=400)
+            outcome, previous_run = db.reserve_api_run_idempotency(
+                gateway_session_key, idem_key, hashlib.sha256(raw_body).hexdigest(), run_id,
+                logical_session_id=logical_session_id or session_id,
+                effective_session_id=session_id,
+                revision=int(context_state["revision"]) if context_state else 0,
+            )
+            if outcome == "conflict":
+                return web.json_response(_openai_error("Idempotency-Key was used with a different request", code="idempotency_key_conflict"), status=409)
+            if outcome == "existing":
+                previous = self._run_statuses.get(previous_run) or db.get_api_run(previous_run) or {}
+                if previous_run in self._active_run_tasks or str(previous.get("status") or "") in {"completed", "failed", "cancelled", "stopped"}:
+                    return web.json_response({"run_id": previous_run, "status": previous.get("status", "accepted")}, status=202)
+                # Previous process died after durable reservation. Recreate the
+                # exact run under the same public id from this authenticated body.
+                run_id = previous_run
         # Approval queues gate host-side tool execution and must be isolated
         # per API run. Client-provided session IDs are conversation scopes, not
         # authorization namespaces.
@@ -6314,7 +6539,73 @@ class APIServerAdapter(BasePlatformAdapter):
                 "text": commentary,
             }, loop)
 
+        compression_observed: Dict[str, Any] = {"seen": False}
+
         def _agent_event_cb(name: str, payload: Dict[str, Any]) -> None:
+            if name in {"session:compress_started", "session:compress_failed"} and isinstance(payload, dict):
+                operation_id = payload.get("operation_id")
+                if not isinstance(operation_id, str) or not re.fullmatch(r"ctxop_[0-9a-f]{32}", operation_id):
+                    return
+                event_name = (
+                    "session.context.compression_started"
+                    if name == "session:compress_started"
+                    else "session.context.compression_failed"
+                )
+                telemetry: Dict[str, Any] = {"operationId": operation_id, "runId": run_id}
+                reason = payload.get("reason")
+                allowed_reasons = {
+                    "threshold", "manual", "compressor_error", "summary_unavailable",
+                    "no_progress", "boundary_error",
+                }
+                if reason in allowed_reasons:
+                    telemetry["reason"] = reason
+                before_usage = self._safe_context_usage(payload.get("before_usage"))
+                if before_usage is not None:
+                    telemetry["before"] = {"used": before_usage, "measurement": "estimated"}
+                duration = payload.get("duration")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(float(duration)) and 0 <= float(duration) <= 86400:
+                    telemetry["duration"] = round(float(duration), 3)
+                if db is not None and context_mode:
+                    try:
+                        logical_context_id = logical_session_id or session_id
+                        row = db.append_context_event(
+                            logical_context_id,
+                            event_type=name,
+                            telemetry=telemetry,
+                        )
+                        self._emit_run_event(run_id, {
+                            "event": event_name,
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "logicalSessionId": logical_context_id,
+                            "effectiveSessionId": row["effective_session_id"],
+                            "contextRevision": row["revision"],
+                            "compressionEpoch": row["compression_epoch"],
+                            **telemetry,
+                        }, loop)
+                    except Exception:
+                        logger.debug("Could not persist compression lifecycle event", exc_info=True)
+                return
+            if name == "session:compress" and isinstance(payload, dict):
+                # Reconcile once at the locked terminal boundary.  This catches
+                # in-place compression where the physical session does not rotate.
+                compression_observed["seen"] = True
+                for source, target in (("before_usage", "before"), ("before_tokens", "before"), ("after_usage", "after"), ("after_tokens", "after")):
+                    value = self._safe_context_usage(payload.get(source))
+                    if value is not None:
+                        compression_observed[target] = value
+                count = payload.get("compression_count")
+                if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 100000:
+                    compression_observed["compressionCount"] = count
+                if isinstance(payload.get("in_place"), bool):
+                    compression_observed["mode"] = "in_place" if payload["in_place"] else "rotated"
+                operation_id = payload.get("operation_id")
+                if isinstance(operation_id, str) and re.fullmatch(r"ctxop_[0-9a-f]{32}", operation_id):
+                    compression_observed["operationId"] = operation_id
+                duration = payload.get("duration")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(float(duration)) and 0 <= float(duration) <= 86400:
+                    compression_observed["duration"] = round(float(duration), 3)
+                return
             if name == "provider:recovered":
                 self._emit_run_event(run_id, {
                     "event": "provider.recovered", "run_id": run_id, "timestamp": time.time(),
@@ -6344,6 +6635,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "queued",
             created_at=created_at,
             session_id=session_id,
+            logical_session_id=logical_session_id or session_id,
+            effective_session_id=session_id,
+            context_revision=(context_state["revision"] if context_state else 0),
             model=body.get("model", self._model_name),
         )
 
@@ -6354,7 +6648,13 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            nonlocal session_id, conversation_history
             heartbeat_task: Optional["asyncio.Task"] = None
+            context_lock = self._context_lock(logical_session_id) if context_mode else None
+            waited_for_context_lock = bool(context_lock is not None and context_lock.locked())
+            if context_lock is not None:
+                await context_lock.acquire()
+            turn_expected_revision = expected_revision
 
             async def _heartbeat() -> None:
                 while True:
@@ -6368,6 +6668,23 @@ class APIServerAdapter(BasePlatformAdapter):
             if continuation_idempotency_key is not None and continuation_owner_uuid is not None:
                 heartbeat_task = asyncio.create_task(_heartbeat())
             try:
+                # Re-resolve after acquiring the per-logical-session lock so
+                # history load, agent turn and pointer advance are one domain.
+                if context_mode and db is not None:
+                    current_state = db.get_or_create_context_state(logical_session_id)
+                    accepted_revision = self._context_turn_revision(
+                        expected_revision, int(current_state["revision"]),
+                        waited_for_lock=waited_for_context_lock,
+                    )
+                    if accepted_revision is None:
+                        self._set_run_status(run_id, "failed", last_event="context.revision_conflict")
+                        self._emit_run_event(run_id, {"event": "run.failed", "run_id": run_id, "timestamp": time.time()}, loop)
+                        return
+                    turn_expected_revision = accepted_revision
+                    session_id = current_state["effective_session_id"]
+                    if context_mode == "session" or expected_revision:
+                        conversation_history = db.get_messages_as_conversation(session_id)
+                    self._set_run_status(run_id, "queued", effective_session_id=session_id, context_revision=current_state["revision"])
                 if not synthesize_only:
                     self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -6396,6 +6713,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         synthesize_only=synthesize_only,
                     )
+                agent._anton_run_id = run_id
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -6537,6 +6855,31 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                # Compression may rotate the physical session during the run.
+                # Reconcile the durable logical pointer even when callbacks were missed.
+                effective_session_id = getattr(agent, "session_id", session_id) or session_id
+                if context_mode and db is not None:
+                    compressed_now = bool(compression_observed["seen"] or effective_session_id != session_id)
+                    telemetry: Dict[str, Any] = {"reason": "threshold", "measurement": "actual", "runId": run_id}
+                    for key in ("compressionCount", "mode", "operationId", "duration"):
+                        if key in compression_observed:
+                            telemetry[key] = compression_observed[key]
+                    if "before" in compression_observed:
+                        telemetry["before"] = {"used": compression_observed["before"], "measurement": "actual"}
+                    if "after" in compression_observed:
+                        telemetry["after"] = {"used": compression_observed["after"], "measurement": "actual"}
+                    advanced = db.advance_context_state(
+                        logical_session_id, expected_revision=turn_expected_revision,
+                        effective_session_id=effective_session_id,
+                        event_type="session:compress" if compressed_now else "context.updated",
+                        compressed=compressed_now,
+                        telemetry=telemetry if compressed_now else None,
+                    )
+                    if advanced is not None:
+                        self._set_run_status(run_id, "running", effective_session_id=effective_session_id, context_revision=advanced["revision"])
+                        if compression_observed["seen"] or effective_session_id != session_id:
+                            event = {"event": "session.context.compressed", "run_id": run_id, "timestamp": time.time(), "logicalSessionId": logical_session_id, "effectiveSessionId": effective_session_id, "contextRevision": advanced["revision"], "compressionEpoch": advanced["compression_epoch"], **telemetry}
+                            self._emit_run_event(run_id, event, loop)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -6625,6 +6968,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                         "artifacts": artifacts,
+                        "logicalSessionId": self._run_statuses.get(run_id, {}).get("logical_session_id"),
+                        "effectiveSessionId": self._run_statuses.get(run_id, {}).get("effective_session_id"),
+                        "contextRevision": self._run_statuses.get(run_id, {}).get("context_revision"),
+                        "compressionEpoch": advanced["compression_epoch"] if context_mode and db is not None and advanced is not None else 0,
                     })
                     self._set_run_status(
                         run_id,
@@ -6639,6 +6986,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # make a completed run look active or stoppable.
                     self._active_run_agents.pop(run_id, None)
                     self._active_run_tasks.pop(run_id, None)
+                    if context_mode and db is not None:
+                        revision = self._run_statuses.get(run_id, {}).get("context_revision")
+                        if isinstance(revision, int):
+                            compaction_task = asyncio.create_task(self._post_run_compact(logical_session_id, revision, agent))
+                            self._background_tasks.add(compaction_task)
+                            compaction_task.add_done_callback(self._background_tasks.discard)
                     # Title generation is deliberately post-completion: the answer
                     # is already durable/visible and auxiliary failure is harmless.
                     if not any(item.get("role") == "user" for item in conversation_history) and final_response:
@@ -6720,6 +7073,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._response_store.finish_anton_synthesis(
                             continuation_idempotency_key, continuation_owner_uuid, safe_terminal,
                         )
+                if context_lock is not None and context_lock.locked():
+                    context_lock.release()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -6781,6 +7136,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if status is not None:
                 self._run_statuses[run_id] = status
         if status is None:
+            db = self._ensure_session_db()
+            persisted = db.get_api_run(run_id) if db is not None else None
+            if persisted is not None:
+                return web.json_response({"object": "hermes.run", "run_id": run_id, "status": persisted["status"], "logical_session_id": persisted["logical_session_id"], "effective_session_id": persisted["effective_session_id"], "context_revision": persisted["revision"], "created_at": persisted["created_at"], "updated_at": persisted["updated_at"]})
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,

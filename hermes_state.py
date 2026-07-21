@@ -883,6 +883,44 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+-- Public durable context metadata only; raw prompts, summaries, tool data,
+-- reasoning and provider errors never enter these tables.
+CREATE TABLE IF NOT EXISTS context_states (
+    logical_session_id TEXT PRIMARY KEY,
+    effective_session_id TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    compression_epoch INTEGER NOT NULL DEFAULT 0,
+    last_compressed_at REAL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS context_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    logical_session_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    compression_epoch INTEGER NOT NULL DEFAULT 0,
+    event_type TEXT NOT NULL,
+    effective_session_id TEXT NOT NULL,
+    telemetry_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_run_idempotency (
+    scope TEXT NOT NULL,
+    idem_key TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (scope, idem_key)
+);
+CREATE TABLE IF NOT EXISTS api_runs (
+    run_id TEXT PRIMARY KEY,
+    logical_session_id TEXT NOT NULL,
+    effective_session_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -893,6 +931,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_context_events_cursor
+    ON context_events(logical_session_id, id);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -4294,6 +4334,140 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+
+    # ── Durable public API context ownership ──────────────────────────────
+
+    def get_or_create_context_state(self, logical_session_id: str, *, effective_session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return the stable logical-session pointer, creating it atomically.
+
+        This is deliberately separate from transcript lineage: a compression can
+        rotate the physical session while this logical ID remains client-stable.
+        """
+        effective = effective_session_id or logical_session_id
+        now = time.time()
+        def _do(conn):
+            conn.execute("INSERT OR IGNORE INTO context_states (logical_session_id, effective_session_id, revision, compression_epoch, updated_at) VALUES (?, ?, 0, 0, ?)", (logical_session_id, effective, now))
+            return dict(conn.execute("SELECT * FROM context_states WHERE logical_session_id = ?", (logical_session_id,)).fetchone())
+        return self._execute_write(_do)
+
+    def advance_context_state(self, logical_session_id: str, *, expected_revision: int, effective_session_id: str, event_type: str = "context.updated", compressed: bool = False, telemetry: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """CAS-advance a public context pointer and append a safe outbox event."""
+        now = time.time()
+        public_telemetry = telemetry if isinstance(telemetry, dict) else {}
+        telemetry_json = json.dumps(public_telemetry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        def _do(conn):
+            row = conn.execute("SELECT * FROM context_states WHERE logical_session_id = ?", (logical_session_id,)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO context_states (logical_session_id, effective_session_id, revision, compression_epoch, updated_at) VALUES (?, ?, 0, 0, ?)", (logical_session_id, logical_session_id, now))
+                row = conn.execute("SELECT * FROM context_states WHERE logical_session_id = ?", (logical_session_id,)).fetchone()
+            if int(row["revision"]) != int(expected_revision):
+                return None
+            revision = int(expected_revision) + 1
+            epoch = int(row["compression_epoch"]) + (1 if compressed else 0)
+            conn.execute("UPDATE context_states SET effective_session_id=?, revision=?, compression_epoch=?, last_compressed_at=?, updated_at=? WHERE logical_session_id=?", (effective_session_id, revision, epoch, now if compressed else row["last_compressed_at"], now, logical_session_id))
+            conn.execute("INSERT INTO context_events (logical_session_id, revision, compression_epoch, event_type, effective_session_id, telemetry_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (logical_session_id, revision, epoch, event_type, effective_session_id, telemetry_json, now))
+            # Public cursor outbox, not an audit log: keep replay bounded.
+            conn.execute("DELETE FROM context_events WHERE logical_session_id=? AND id NOT IN (SELECT id FROM context_events WHERE logical_session_id=? ORDER BY id DESC LIMIT 1000)", (logical_session_id, logical_session_id))
+            return dict(conn.execute("SELECT * FROM context_states WHERE logical_session_id = ?", (logical_session_id,)).fetchone())
+        return self._execute_write(_do)
+
+    def append_context_event(
+        self,
+        logical_session_id: str,
+        *,
+        event_type: str,
+        telemetry: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Append lifecycle metadata without advancing revision or epoch."""
+        now = time.time()
+        public_telemetry = telemetry if isinstance(telemetry, dict) else {}
+        telemetry_json = json.dumps(public_telemetry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM context_states WHERE logical_session_id = ?",
+                (logical_session_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO context_states (logical_session_id, effective_session_id, revision, compression_epoch, updated_at) VALUES (?, ?, 0, 0, ?)",
+                    (logical_session_id, logical_session_id, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM context_states WHERE logical_session_id = ?",
+                    (logical_session_id,),
+                ).fetchone()
+            cursor = conn.execute(
+                "INSERT INTO context_events (logical_session_id, revision, compression_epoch, event_type, effective_session_id, telemetry_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    logical_session_id,
+                    int(row["revision"]),
+                    int(row["compression_epoch"]),
+                    event_type,
+                    row["effective_session_id"],
+                    telemetry_json,
+                    now,
+                ),
+            ).lastrowid
+            conn.execute(
+                "DELETE FROM context_events WHERE logical_session_id=? AND id NOT IN (SELECT id FROM context_events WHERE logical_session_id=? ORDER BY id DESC LIMIT 1000)",
+                (logical_session_id, logical_session_id),
+            )
+            return dict(conn.execute("SELECT * FROM context_events WHERE id = ?", (cursor,)).fetchone())
+
+        return self._execute_write(_do)
+
+    def list_context_events(self, logical_session_id: str, *, after: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        rows = self._conn.execute("SELECT id, logical_session_id, revision, compression_epoch, event_type, effective_session_id, telemetry_json, created_at FROM context_events WHERE logical_session_id=? AND id>? ORDER BY id ASC LIMIT ?", (logical_session_id, max(0, int(after)), limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def context_event_bounds(self, logical_session_id: str) -> Tuple[Optional[int], Optional[int]]:
+        """Return retained public-outbox cursor bounds for gap detection."""
+        row = self._conn.execute(
+            "SELECT MIN(id) AS minimum, MAX(id) AS maximum FROM context_events WHERE logical_session_id=?",
+            (logical_session_id,),
+        ).fetchone()
+        return ((row["minimum"], row["maximum"]) if row else (None, None))
+
+    def latest_context_event(self, logical_session_id: str) -> Optional[Dict[str, Any]]:
+        conn = self._conn
+        if conn is None:
+            return None
+        row = conn.execute(
+            "SELECT id, logical_session_id, revision, compression_epoch, event_type, effective_session_id, telemetry_json, created_at FROM context_events WHERE logical_session_id=? ORDER BY id DESC LIMIT 1",
+            (logical_session_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def reserve_api_run_idempotency(
+        self, scope: str, idem_key: str, body_digest: str, run_id: str, *,
+        logical_session_id: str = "", effective_session_id: str = "", revision: int = 0,
+    ) -> tuple[str, str]:
+        """Atomically reserve a caller-scoped idempotency key.
+
+        Returns ``(created|existing|conflict, run_id)`` and survives restarts.
+        """
+        now = time.time()
+        def _do(conn):
+            row = conn.execute("SELECT body_digest, run_id FROM api_run_idempotency WHERE scope=? AND idem_key=?", (scope, idem_key)).fetchone()
+            if row is not None:
+                return ("existing" if row["body_digest"] == body_digest else "conflict", row["run_id"])
+            conn.execute("INSERT INTO api_run_idempotency (scope, idem_key, body_digest, run_id, created_at) VALUES (?, ?, ?, ?, ?)", (scope, idem_key, body_digest, run_id, now))
+            conn.execute(
+                "INSERT INTO api_runs (run_id, logical_session_id, effective_session_id, revision, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+                (run_id, logical_session_id, effective_session_id, revision, now, now),
+            )
+            return "created", run_id
+        return self._execute_write(_do)
+
+    def save_api_run(self, run_id: str, logical_session_id: str, effective_session_id: str, revision: int, status: str) -> None:
+        now = time.time()
+        self._execute_write(lambda conn: conn.execute("INSERT INTO api_runs (run_id, logical_session_id, effective_session_id, revision, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET effective_session_id=excluded.effective_session_id, revision=excluded.revision, status=excluded.status, updated_at=excluded.updated_at", (run_id, logical_session_id, effective_session_id, revision, status, now, now)))
+
+    def get_api_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute("SELECT * FROM api_runs WHERE run_id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
 
     def get_messages(
         self,
