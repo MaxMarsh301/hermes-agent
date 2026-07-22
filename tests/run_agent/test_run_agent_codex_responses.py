@@ -2367,6 +2367,47 @@ def test_interim_commentary_preserves_assistant_content(monkeypatch):
     assert "I'll inspect the repo structure first." in observed["text"]
 
 
+def test_interim_commentary_flattens_visible_multipart_assistant_content(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = {}
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.update(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message({
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "provider scratchpad"},
+            {"type": "text", "text": "<think>hidden</think>Visible text."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "output_text", "text": "Second visible block."},
+            {"type": "tool_use", "name": "terminal", "input": {"command": "private"}},
+        ],
+    })
+
+    assert observed == {
+        "text": "Visible text.\nSecond visible block.",
+        "already_streamed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        {},
+        42,
+        [],
+        [{"type": "thinking", "thinking": "provider scratchpad"}],
+        [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}],
+    ],
+)
+def test_interim_commentary_ignores_unsupported_or_non_text_content(monkeypatch, content):
+    agent = _build_agent(monkeypatch)
+
+    assert agent._interim_assistant_visible_text({"role": "assistant", "content": content}) == ""
+
+
 def test_interim_commentary_precedes_content_from_real_codex_normalization(monkeypatch):
     """Structured commentary wins over final-answer content on tool turns."""
     agent = _build_agent(monkeypatch)

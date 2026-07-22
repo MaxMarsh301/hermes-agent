@@ -4837,6 +4837,33 @@ class AIAgent:
             self._extract_codex_interim_visible_parts(assistant_msg)
         ).strip()
 
+    @staticmethod
+    def _interim_assistant_content_as_text(content: Any) -> str:
+        """Return only user-visible text from supported assistant content.
+
+        Some provider adapters preserve assistant content as an ordered list of
+        text, thinking, image, and tool-use blocks.  Interim delivery must never
+        pass that list to the string-only think-block scrubber or stringify
+        non-text blocks into the user-visible response.
+        """
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                if part:
+                    parts.append(part)
+                continue
+            if not isinstance(part, dict) or part.get("type") not in {"text", "output_text"}:
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return "\n".join(parts)
+
     def _interim_assistant_visible_text(self, assistant_msg: Dict[str, Any]) -> str:
         """Return the exact assistant text eligible for interim delivery.
 
@@ -4848,8 +4875,8 @@ class AIAgent:
         visible = self._extract_codex_interim_visible_text(assistant_msg)
         if visible:
             return visible
-        content = assistant_msg.get("content")
-        return self._strip_think_blocks(content or "").strip()
+        content = self._interim_assistant_content_as_text(assistant_msg.get("content"))
+        return self._strip_think_blocks(content).strip()
 
     def _interim_text_was_delivered(self, text: str) -> bool:
         normalized = self._normalize_interim_visible_text(text)
