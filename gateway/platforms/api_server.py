@@ -1483,7 +1483,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-run deadline guards. A cooperative executor normally exits well
         # before the deadline; this keeps a broken tool from pinning a public
         # run and its conversation slot in ``stopping`` forever.
-        self._run_stop_watchdogs: Dict[str, "asyncio.Task"] = {}
+        self._run_stop_watchdogs: Dict[str, "asyncio.TimerHandle"] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Logical-session domains serialize history load -> agent turn -> pointer
@@ -6201,35 +6201,26 @@ class APIServerAdapter(BasePlatformAdapter):
         self._close_run_event_emitter(run_id)
         return True
 
-    async def _stop_run_watchdog(self, run_id: str, task: "asyncio.Task") -> None:
-        """Bound ``stopping`` even when an executor-backed thread never returns."""
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=float(self._RUN_STOP_GRACE_SECONDS),
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                "[api_server] run %s exceeded %.1fs stop deadline; terminalizing",
-                run_id,
-                float(self._RUN_STOP_GRACE_SECONDS),
-            )
-            if self._terminalize_stopped_run(run_id, reason="stop_deadline_exceeded"):
-                # Keep the executor task/agent tracked until the worker really
-                # returns. Hiding an uncooperative thread would undercount live
-                # work during shutdown and permit unsafe concurrent mutation;
-                # external status is terminal, while the context lock remains
-                # the final serialization barrier for any queued successor.
-                status_record = self._run_statuses.get(run_id, {})
-                logical_session_id = status_record.get("logical_session_id")
-                if isinstance(logical_session_id, str) and logical_session_id:
-                    self._schedule_api_queue_dispatch(logical_session_id)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            current_watchdog = self._run_stop_watchdogs.get(run_id)
-            if current_watchdog is asyncio.current_task():
-                self._run_stop_watchdogs.pop(run_id, None)
+    def _stop_run_deadline_expired(self, run_id: str, task: "asyncio.Task") -> None:
+        """Terminalize one run whose cooperative stop exceeded its deadline."""
+        self._run_stop_watchdogs.pop(run_id, None)
+        if task.done():
+            return
+        logger.error(
+            "[api_server] run %s exceeded %.1fs stop deadline; terminalizing",
+            run_id,
+            float(self._RUN_STOP_GRACE_SECONDS),
+        )
+        if self._terminalize_stopped_run(run_id, reason="stop_deadline_exceeded"):
+            # Keep the executor task/agent tracked until the worker really
+            # returns. Hiding an uncooperative thread would undercount live
+            # work during shutdown and permit unsafe concurrent mutation;
+            # external status is terminal, while the context lock remains
+            # the final serialization barrier for any queued successor.
+            status_record = self._run_statuses.get(run_id, {})
+            logical_session_id = status_record.get("logical_session_id")
+            if isinstance(logical_session_id, str) and logical_session_id:
+                self._schedule_api_queue_dispatch(logical_session_id)
 
     async def _kill_run_owned_processes(self, agent: Any) -> None:
         """Terminate background terminal processes owned by this exact turn."""
@@ -7874,7 +7865,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_approval_ids.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
                 watchdog = self._run_stop_watchdogs.pop(run_id, None)
-                if watchdog is not None and watchdog is not asyncio.current_task():
+                if watchdog is not None:
                     watchdog.cancel()
                 for clarification_id in self._run_clarification_ids.pop(run_id, set()):
                     try:
@@ -8509,10 +8500,13 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._kill_run_owned_processes(agent)
 
         if task is not None and not task.done() and run_id not in self._run_stop_watchdogs:
-            watchdog = asyncio.create_task(self._stop_run_watchdog(run_id, task))
+            watchdog = asyncio.get_running_loop().call_later(
+                float(self._RUN_STOP_GRACE_SECONDS),
+                self._stop_run_deadline_expired,
+                run_id,
+                task,
+            )
             self._run_stop_watchdogs[run_id] = watchdog
-            self._background_tasks.add(watchdog)
-            watchdog.add_done_callback(self._background_tasks.discard)
 
         current_status = self._run_statuses.get(run_id, {}).get("status", "stopping")
         return web.json_response({"run_id": run_id, "status": current_status})
