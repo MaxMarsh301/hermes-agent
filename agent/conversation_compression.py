@@ -457,6 +457,56 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
     })
 
 
+def _inject_todo_snapshot_before_latest_user(compressed: list, todo_snapshot: str) -> None:
+    """Preserve Todo state without manufacturing the newest user instruction.
+
+    Todo is agent-owned continuation state, not a message from the human.  The
+    old compaction path appended it as ``role=user`` after the compressed tail;
+    on the next model call that synthetic row therefore outranked a newer real
+    request.  Keep the snapshot in assistant-owned context immediately before
+    the latest preserved user turn instead.  When an assistant summary already
+    precedes that turn, merge into it so role alternation remains unchanged.
+    """
+    if not todo_snapshot:
+        return
+    latest_user = next(
+        (
+            index
+            for index in range(len(compressed) - 1, -1, -1)
+            if isinstance(compressed[index], dict)
+            and compressed[index].get("role") == "user"
+        ),
+        None,
+    )
+    if latest_user is None:
+        return
+
+    snapshot_text = (
+        "[Agent continuation state — subordinate to the next user message]\n"
+        f"{todo_snapshot}"
+    )
+    if latest_user > 0:
+        previous = compressed[latest_user - 1]
+        if (
+            isinstance(previous, dict)
+            and previous.get("role") == "assistant"
+            and not previous.get("tool_calls")
+            and isinstance(previous.get("content"), str)
+        ):
+            previous["content"] = f"{previous['content'].rstrip()}\n\n{snapshot_text}"
+            previous["_compaction_todo_snapshot"] = True
+            return
+
+    compressed.insert(
+        latest_user,
+        {
+            "role": "assistant",
+            "content": snapshot_text,
+            "_compaction_todo_snapshot": True,
+        },
+    )
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -853,10 +903,10 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        _ensure_compressed_has_user_turn(messages, compressed)
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
-        _ensure_compressed_has_user_turn(messages, compressed)
+            _inject_todo_snapshot_before_latest_user(compressed, todo_snapshot)
 
         agent._invalidate_system_prompt()
         new_system_prompt = agent._build_system_prompt(system_message)

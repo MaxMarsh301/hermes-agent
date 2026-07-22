@@ -1662,6 +1662,80 @@ class TestStopRun:
                 assert adapter._run_statuses[run_id]["status"] == "cancelled"
 
     @pytest.mark.asyncio
+    async def test_stop_deadline_terminalizes_uncooperative_executor_and_blocks_late_result(self, adapter):
+        """A tool that ignores cooperative stop cannot pin the run forever."""
+        app = _create_runs_app(adapter)
+        run_can_finish = threading.Event()
+        started = threading.Event()
+        adapter._RUN_STOP_GRACE_SECONDS = 0.05
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+
+                def _run_conversation(*_args, **_kwargs):
+                    started.set()
+                    run_can_finish.wait(timeout=2)
+                    return {"final_response": "late result must be ignored"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_create.return_value = mock_agent
+
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert started.wait(timeout=3)
+
+                stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_response.status == 200
+
+                for _ in range(40):
+                    if adapter._run_statuses[run_id]["status"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert adapter._run_statuses[run_id]["stop_reason"] == "stop_deadline_exceeded"
+                assert run_id in adapter._active_run_agents
+                assert run_id in adapter._active_run_tasks
+
+                run_can_finish.set()
+                for _ in range(40):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.01)
+                assert run_id not in adapter._active_run_agents
+                assert run_id not in adapter._active_run_tasks
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert adapter._run_statuses[run_id].get("output") != "late result must be ignored"
+
+    @pytest.mark.asyncio
+    async def test_stop_kills_background_processes_owned_by_the_run_task(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, \
+                 patch("tools.process_registry.process_registry.kill_all", return_value=1) as kill_all:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_agent._current_task_id = "run-owned-task"
+                mock_create.return_value = mock_agent
+
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert agent_ready.wait(timeout=3)
+
+                stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_response.status == 200
+                kill_all.assert_called_once_with("run-owned-task")
+                for _ in range(40):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.01)
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert run_id not in adapter._active_run_tasks
+
+    @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):
         """Stop should interrupt the agent and cancel the task."""
         app = _create_runs_app(adapter)

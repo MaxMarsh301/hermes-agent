@@ -310,4 +310,36 @@ def build_verify_on_stop_nudge(
     )
 
 
-__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]
+def build_post_verification_report_nudge(
+    *,
+    changed_paths: Iterable[str],
+    attempts: int = 0,
+    max_attempts: int = 1,
+) -> str | None:
+    """Return one bounded handoff from internal verification to user result.
+
+    A verification follow-up is an internal checkpoint, not the answer to the
+    original implementation request. Separating the phases prevents a model
+    from ending the run with only "verification passed" after it has completed
+    the requested work.
+    """
+    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
+    if not paths or attempts >= max_attempts:
+        return None
+    return (
+        "[System: The verification checkpoint is complete. Do not answer with "
+        "only a verification receipt. Return to the original user request and "
+        "provide the final user-facing implementation report now. Include: "
+        "(1) the delivered result, (2) changed files/components, (3) tests and "
+        "live checks actually run, (4) commit plus push/deploy status, and "
+        "(5) concrete limitations or unfinished work. Keep internal reasoning "
+        "and intermediate verification narration out of the answer. Do not run "
+        "more tools unless a material fact required by that report is missing.]"
+    )
+
+
+__all__ = [
+    "build_post_verification_report_nudge",
+    "build_verify_on_stop_nudge",
+    "verify_on_stop_enabled",
+]
