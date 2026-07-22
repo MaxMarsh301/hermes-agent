@@ -290,6 +290,7 @@ async def test_queue_recovery_reclaims_once_and_stop_policy_keeps_queued(control
     adapter, db = control_plane
     _seed_transcript(db, "recover")
     db.get_or_create_context_state("recover")
+    db.save_api_run("orphan-direct", "recover", "recover", 0, "stopping")
     db.save_api_run("old-parent", "recover", "recover", 0, "running")
     item_id = "queue_" + "a" * 32
     db.reserve_api_queue_item(
@@ -310,6 +311,7 @@ async def test_queue_recovery_reclaims_once_and_stop_policy_keeps_queued(control
     await second._recover_api_run_queue()
     await second._queue_dispatch_tasks["recover"]
     assert calls == 1
+    assert db.get_api_run("orphan-direct")["status"] == "failed"
     assert db.get_api_run("old-parent")["status"] == "failed"
     assert db.get_api_queue_item(item_id)["state"] == "completed"
 

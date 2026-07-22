@@ -4767,6 +4767,22 @@ class SessionDB:
                      )""",
                 (now, now),
             )
+            # Any nonterminal direct run belonged to the previous API process;
+            # it has no executor/task to resume after restart.  Keep durable
+            # queue dispatch children recoverable below, but fail every other
+            # orphan so callers do not poll a permanent running/stopping row.
+            conn.execute(
+                """UPDATE api_runs SET status='failed', updated_at=?
+                   WHERE status IN (
+                     'queued','running','waiting_for_approval',
+                     'waiting_for_clarification','stopping'
+                   )
+                     AND run_id NOT IN (
+                       SELECT dispatch_run_id FROM api_run_queue
+                       WHERE state IN ('queued','dispatching','running')
+                     )""",
+                (now,),
+            )
             parent_ids = [
                 row[0] for row in conn.execute(
                     "SELECT DISTINCT parent_run_id FROM api_run_queue WHERE state IN ('queued','dispatching','running')"
