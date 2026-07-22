@@ -5512,6 +5512,55 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # Verification is an internal checkpoint, never the final
+                # user-facing deliverable. After at least one verification
+                # continuation, require exactly one bounded handoff back to the
+                # original implementation request. Kanban workers have their
+                # own terminal-tool protocol below and must not enter this path.
+                _report_nudge = None
+                _verification_turns = (
+                    getattr(agent, "_verification_stop_nudges", 0)
+                    + getattr(agent, "_pre_verify_nudges", 0)
+                )
+                if _verification_turns and not os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from agent.verification_stop import (
+                            build_post_verification_report_nudge,
+                        )
+
+                        _report_nudge = build_post_verification_report_nudge(
+                            changed_paths=getattr(
+                                agent, "_turn_file_mutation_paths", set()
+                            ),
+                            attempts=getattr(
+                                agent, "_post_verification_report_nudges", 0
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "post-verification report check failed", exc_info=True
+                        )
+
+                if _report_nudge:
+                    agent._post_verification_report_nudges = (
+                        getattr(agent, "_post_verification_report_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "final_report_required"
+                    final_msg["_post_verification_report_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _report_nudge,
+                        "_post_verification_report_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug("post-verification final-report nudge issued")
+                    # Preserve the pre-verification attempted answer as the
+                    # bounded exhaustion fallback; never replace it with this
+                    # internal checkpoint response.
+                    final_response = None
+                    continue
+
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the

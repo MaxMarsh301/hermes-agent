@@ -1480,6 +1480,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_session_runs: Dict[str, int] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
+        # Per-run deadline guards. A cooperative executor normally exits well
+        # before the deadline; this keeps a broken tool from pinning a public
+        # run and its conversation slot in ``stopping`` forever.
+        self._run_stop_watchdogs: Dict[str, "asyncio.Task"] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Logical-session domains serialize history load -> agent turn -> pointer
@@ -6122,6 +6126,8 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds to retain a completed stream for replay
     _RUN_EVENT_RETENTION = 512  # bounded public events retained per run
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_STOP_GRACE_SECONDS = 10.0
+    _RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped"})
     _ANTON_SYNTHESIS_LEASE_SECONDS = 15.0
     _ANTON_SYNTHESIS_HEARTBEAT_SECONDS = 5.0
     _RUN_SSE_WRITE_TIMEOUT = 15  # stalled clients cannot pin an SSE handler
@@ -6130,6 +6136,26 @@ class APIServerAdapter(BasePlatformAdapter):
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        current_status = str(current.get("status") or "")
+        # Late executor callbacks must never resurrect a stopped/terminal run.
+        # Context reconciliation used to write ``running`` after Stop and before
+        # the executor returned, which left the external control plane wedged.
+        if current_status in self._RUN_TERMINAL_STATUSES and status != current_status:
+            logger.warning(
+                "[api_server] ignored late run transition %s -> %s for %s",
+                current_status,
+                status,
+                run_id,
+            )
+            return current
+        allowed_while_stopping = self._RUN_TERMINAL_STATUSES | {"stopping"}
+        if current_status == "stopping" and status not in allowed_while_stopping:
+            logger.warning(
+                "[api_server] ignored late run transition stopping -> %s for %s",
+                status,
+                run_id,
+            )
+            return current
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -6146,6 +6172,76 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("Could not persist public run status", exc_info=True)
         return current
+
+    def _terminalize_stopped_run(self, run_id: str, *, reason: str) -> bool:
+        """Publish one terminal cancellation and permanently close its stream."""
+        current = self._run_statuses.get(run_id, {})
+        if current.get("status") in self._RUN_TERMINAL_STATUSES:
+            return False
+        self._set_run_status(
+            run_id,
+            "cancelled",
+            last_event="run.cancelled",
+            stop_reason=reason,
+        )
+        self._emit_run_event(
+            run_id,
+            {
+                "event": "run.cancelled",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "reason": reason,
+            },
+        )
+        self._close_run_event_emitter(run_id)
+        return True
+
+    async def _stop_run_watchdog(self, run_id: str, task: "asyncio.Task") -> None:
+        """Bound ``stopping`` even when an executor-backed thread never returns."""
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=float(self._RUN_STOP_GRACE_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[api_server] run %s exceeded %.1fs stop deadline; terminalizing",
+                run_id,
+                float(self._RUN_STOP_GRACE_SECONDS),
+            )
+            if self._terminalize_stopped_run(run_id, reason="stop_deadline_exceeded"):
+                # Keep the executor task/agent tracked until the worker really
+                # returns. Hiding an uncooperative thread would undercount live
+                # work during shutdown and permit unsafe concurrent mutation;
+                # external status is terminal, while the context lock remains
+                # the final serialization barrier for any queued successor.
+                status_record = self._run_statuses.get(run_id, {})
+                logical_session_id = status_record.get("logical_session_id")
+                if isinstance(logical_session_id, str) and logical_session_id:
+                    self._schedule_api_queue_dispatch(logical_session_id)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current_watchdog = self._run_stop_watchdogs.get(run_id)
+            if current_watchdog is asyncio.current_task():
+                self._run_stop_watchdogs.pop(run_id, None)
+
+    async def _kill_run_owned_processes(self, agent: Any) -> None:
+        """Terminate background terminal processes owned by this exact turn."""
+        task_id = getattr(agent, "_current_task_id", None)
+        if not isinstance(task_id, str) or not task_id:
+            return
+        try:
+            from tools.process_registry import process_registry
+
+            await asyncio.wait_for(
+                asyncio.to_thread(process_registry.kill_all, task_id),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[api_server] timed out killing processes for stopped run")
+        except Exception:
+            logger.debug("Could not kill run-owned background processes", exc_info=True)
 
     def _context_lock(self, logical_session_id: str) -> asyncio.Lock:
         return self._context_locks.setdefault(logical_session_id, asyncio.Lock())
@@ -7431,16 +7527,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             event = {"event": "session.context.compressed", "run_id": run_id, "timestamp": time.time(), "logicalSessionId": logical_session_id, "effectiveSessionId": effective_session_id, "contextRevision": advanced["revision"], "compressionEpoch": advanced["compression_epoch"], **telemetry}
                             self._emit_run_event(run_id, event, loop)
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
+                    self._terminalize_stopped_run(run_id, reason="stop_requested")
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -7644,6 +7731,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_approval_sessions.pop(run_id, None)
                 self._run_approval_ids.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                watchdog = self._run_stop_watchdogs.pop(run_id, None)
+                if watchdog is not None and watchdog is not asyncio.current_task():
+                    watchdog.cancel()
                 for clarification_id in self._run_clarification_ids.pop(run_id, set()):
                     try:
                         from tools.clarify_gateway import resolve_gateway_clarify
@@ -8271,7 +8361,19 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+            # Foreground terminal execution observes the same interrupt bit and
+            # kills its process group. Background terminal sessions are detached
+            # by design, so stop them explicitly by this turn's task id.
+            await self._kill_run_owned_processes(agent)
+
+        if task is not None and not task.done() and run_id not in self._run_stop_watchdogs:
+            watchdog = asyncio.create_task(self._stop_run_watchdog(run_id, task))
+            self._run_stop_watchdogs[run_id] = watchdog
+            self._background_tasks.add(watchdog)
+            watchdog.add_done_callback(self._background_tasks.discard)
+
+        current_status = self._run_statuses.get(run_id, {}).get("status", "stopping")
+        return web.json_response({"run_id": run_id, "status": current_status})
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""

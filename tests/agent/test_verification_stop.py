@@ -9,6 +9,7 @@ from agent.verification_evidence import (
     record_terminal_result,
 )
 from agent.verification_stop import (
+    build_post_verification_report_nudge,
     build_verify_on_stop_nudge,
     verify_on_stop_enabled,
 )
@@ -385,3 +386,26 @@ def test_is_non_code_path_classification():
     assert _is_non_code_path("src/app.ts") is False
     assert _is_non_code_path("config.yaml") is False
     assert _is_non_code_path("run_agent.py") is False
+
+
+def test_post_verification_report_nudge_requires_user_facing_delivery():
+    nudge = build_post_verification_report_nudge(
+        changed_paths=["src/runtime.py"],
+    )
+
+    assert nudge is not None
+    assert "original user request" in nudge
+    assert "changed files/components" in nudge
+    assert "tests and live checks" in nudge
+    assert "push/deploy status" in nudge
+    assert "verification receipt" in nudge
+
+
+def test_post_verification_report_nudge_is_bounded_and_skips_docs():
+    assert build_post_verification_report_nudge(
+        changed_paths=["src/runtime.py"],
+        attempts=1,
+    ) is None
+    assert build_post_verification_report_nudge(
+        changed_paths=["README.md"],
+    ) is None
