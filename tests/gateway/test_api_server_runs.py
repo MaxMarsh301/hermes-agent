@@ -77,6 +77,42 @@ def test_public_approval_request_is_opaque_allowlisted_and_never_reflects_raw_me
         assert private not in public
 
 
+def test_public_memory_skill_and_review_metadata_never_reflect_content():
+    memory = APIServerAdapter._public_memory_tool_fields(
+        {"target": "memory", "operations": [{"action": "add", "content": "token=SECRET"}]},
+        '{"success": true, "current_chars": 42}',
+    )
+    assert memory == {"memory_target": "memory", "operation_count": 1, "staged": False, "committed": True}
+
+    skill = APIServerAdapter._public_skill_tool_fields(
+        {"action": "patch", "name": "cross-repo-signed-delivery", "new_string": "SECRET"},
+        '{"success": true, "message": "Patched SKILL.md in skill \'cross-repo-signed-delivery\' (1 replacement).", "diff": "SECRET"}',
+    )
+    assert skill == {"skill_action": "patch", "staged": False, "committed": True, "replacement_count": 1}
+
+    review = APIServerAdapter._public_review_summary(
+        "💾 Self-improvement review: Memory updated · 📝 Patched SKILL.md in skill 'cross-repo-signed-delivery' (1 replacement)."
+    )
+    assert review == {
+        "event": "review.summary",
+        "review_status": "changed",
+        "memory_updated": True,
+        "skill_updates": [{"name": "cross-repo-signed-delivery", "action": "patch", "replacements": 1}],
+        "change_count": 2,
+    }
+    assert "SECRET" not in repr((memory, skill, review))
+    assert APIServerAdapter._public_review_summary("💾 Self-improvement review: token=SECRET") is None
+    assert APIServerAdapter._public_memory_tool_fields(
+        {"target": "memory", "action": "add"}, '{"success": true, "staged": true}'
+    )["staged"] is True
+    assert APIServerAdapter._public_review_summary(
+        "💾 Self-improvement review: Skill 'new-skill' created."
+    )["skill_updates"] == [{"name": "new-skill", "action": "create"}]
+    assert APIServerAdapter._public_review_summary(
+        "💾 Self-improvement review: No changes."
+    )["review_status"] == "no_changes"
+
+
 def test_public_approval_command_preview_preserves_benign_and_dangerous_shell_structure():
     approval_id = "approval_" + "A" * 32
     benign = "printf '%s\\n' \"$HOME\" | sed -n '1p'\nprintf 'done'"
@@ -214,6 +250,40 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_background_review_summary_is_emitted_after_completed_before_stream_close(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+                def run_with_review(**_kwargs):
+                    def review():
+                        time.sleep(0.05)
+                        agent.background_review_callback(
+                            "💾 Self-improvement review: 📝 Patched SKILL.md in skill 'cross-repo-signed-delivery' (1 replacement)."
+                        )
+
+                    thread = threading.Thread(target=review, daemon=True)
+                    agent._background_review_thread = thread
+                    thread.start()
+                    return {"final_response": "done"}
+
+                agent.run_conversation.side_effect = run_with_review
+                mock_create.return_value = agent
+
+                started = await cli.post("/v1/runs", json={"input": "review"})
+                run_id = (await started.json())["run_id"]
+                response = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await response.text()
+
+        completed_index = body.index('"event": "run.completed"')
+        review_index = body.index('"event": "review.summary"')
+        assert completed_index < review_index
+        assert '"skill_updates": [{"name": "cross-repo-signed-delivery", "action": "patch", "replacements": 1}]' in body
+        assert "stream closed" in body
 
     @pytest.mark.asyncio
     async def test_first_turn_emits_generated_title_after_completion(self, adapter):

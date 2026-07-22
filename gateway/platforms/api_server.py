@@ -2477,6 +2477,11 @@ class APIServerAdapter(BasePlatformAdapter):
             skip_memory=synthesize_only,
             skip_context_files=synthesize_only,
         )
+        raw_memory_notifications = (user_config.get("display") or {}).get("memory_notifications")
+        if isinstance(raw_memory_notifications, bool):
+            raw_memory_notifications = "on" if raw_memory_notifications else "off"
+        memory_notifications = str(raw_memory_notifications or "on").lower()
+        agent.memory_notifications = memory_notifications if memory_notifications in {"off", "on", "verbose"} else "on"
         return agent
 
     # ------------------------------------------------------------------
@@ -6350,8 +6355,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _PUBLIC_RUN_TOOL_NAMES = frozenset({
         "browser_click", "browser_navigate", "browser_snapshot", "browser_type",
-        "delegate_task", "execute_code", "patch", "read_file", "search_files", "skill_view",
-        "terminal", "web_search", "write_file",
+        "delegate_task", "execute_code", "memory", "patch", "read_file", "search_files",
+        "skill_manage", "skill_view", "terminal", "web_search", "write_file",
     })
 
     _PUBLIC_RUN_ACTION_KINDS = {
@@ -6367,6 +6372,8 @@ class APIServerAdapter(BasePlatformAdapter):
         "browser_click": "interact",
         "browser_type": "interact",
         "browser_snapshot": "inspect",
+        "memory": "write",
+        "skill_manage": "edit",
         "skill_view": "read",
     }
 
@@ -6390,7 +6397,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if isinstance(path, str):
                 basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
                 return (basename[:255], "file") if basename else None
-        elif tool_name == "skill_view":
+        elif tool_name in {"skill_view", "skill_manage"}:
             name = args.get("name")
             if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
                 return name, "skill"
@@ -6409,6 +6416,111 @@ class APIServerAdapter(BasePlatformAdapter):
                 basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
                 return (basename[:255], "file") if basename else None
         return None
+
+    @staticmethod
+    def _public_memory_tool_fields(args: Any, result: Any = None) -> Dict[str, Any]:
+        """Project only memory operation metadata; never saved content."""
+        if not isinstance(args, dict):
+            return {}
+        target = args.get("target")
+        action = args.get("action")
+        operations = args.get("operations")
+        fields: Dict[str, Any] = {}
+        if target in {"memory", "user"}:
+            fields["memory_target"] = target
+        if action in {"add", "replace", "remove"}:
+            fields["memory_action"] = action
+        if isinstance(operations, list) and 1 <= len(operations) <= 100:
+            fields["operation_count"] = len(operations)
+        elif "memory_action" in fields:
+            fields["operation_count"] = 1
+        if result is not None:
+            try:
+                parsed = json.loads(result) if isinstance(result, str) else result
+            except Exception:
+                parsed = None
+            staged = isinstance(parsed, dict) and parsed.get("staged") is True
+            fields["staged"] = staged
+            fields["committed"] = bool(isinstance(parsed, dict) and parsed.get("success") is True and not staged)
+        return fields
+
+    @staticmethod
+    def _public_skill_tool_fields(args: Any, result: Any = None) -> Dict[str, Any]:
+        """Project skill identity/action and bounded replacement count only."""
+        if not isinstance(args, dict):
+            return {}
+        fields: Dict[str, Any] = {}
+        action = args.get("action")
+        if action in {"create", "patch", "edit", "delete", "write_file", "remove_file"}:
+            fields["skill_action"] = action
+        if result is not None:
+            try:
+                parsed = json.loads(result) if isinstance(result, str) else result
+            except Exception:
+                parsed = None
+            staged = isinstance(parsed, dict) and parsed.get("staged") is True
+            fields["staged"] = staged
+            fields["committed"] = bool(isinstance(parsed, dict) and parsed.get("success") is True and not staged)
+            message = parsed.get("message") if isinstance(parsed, dict) else None
+            if isinstance(message, str):
+                match = re.fullmatch(
+                    r"Patched (?:SKILL\.md|[A-Za-z0-9_./-]{1,160}) in skill '[A-Za-z0-9][A-Za-z0-9_.-]{0,127}' "
+                    r"\(([1-9][0-9]{0,2}) replacements?\)\.",
+                    message,
+                )
+                if match:
+                    fields["replacement_count"] = int(match.group(1))
+        return fields
+
+    @staticmethod
+    def _public_review_summary(message: Any) -> Optional[Dict[str, Any]]:
+        """Convert a review notification into a closed metadata event."""
+        if not isinstance(message, str) or not message.startswith("💾 Self-improvement review: "):
+            return None
+        if message == "💾 Self-improvement review: No changes.":
+            return {
+                "event": "review.summary", "review_status": "no_changes",
+                "memory_updated": False, "skill_updates": [], "change_count": 0,
+            }
+        memory_updated = False
+        skill_updates: list[Dict[str, Any]] = []
+        for raw_part in message.removeprefix("💾 Self-improvement review: ").split(" · ")[:20]:
+            part = raw_part.strip()
+            if "Memory updated" in part or part.startswith(("Memory ", "User profile ")):
+                memory_updated = True
+                continue
+            match = re.fullmatch(
+                r"(?:📝 )?Patched SKILL\.md in skill '([A-Za-z0-9][A-Za-z0-9_.-]{0,127})' "
+                r"\(([1-9][0-9]{0,2}) replacements?\)\.",
+                part,
+            )
+            if match:
+                skill_updates.append({"name": match.group(1), "action": "patch", "replacements": int(match.group(2))})
+                continue
+            match = re.match(
+                r"📝 Skill '([A-Za-z0-9][A-Za-z0-9_.-]{0,127})' (patched|created|rewritten):",
+                part,
+            )
+            if match:
+                action = {"patched": "patch", "created": "create", "rewritten": "edit"}[match.group(2)]
+                skill_updates.append({"name": match.group(1), "action": action})
+                continue
+            match = re.fullmatch(
+                r"(?:📝 )?Skill '([A-Za-z0-9][A-Za-z0-9_.-]{0,127})' (created|updated \(full rewrite\))\.",
+                part,
+            )
+            if match:
+                action = "create" if match.group(2) == "created" else "edit"
+                skill_updates.append({"name": match.group(1), "action": action})
+        if not memory_updated and not skill_updates:
+            return None
+        return {
+            "event": "review.summary",
+            "review_status": "changed",
+            "memory_updated": memory_updated,
+            "skill_updates": skill_updates,
+            "change_count": int(memory_updated) + len(skill_updates),
+        }
 
     _PUBLIC_AGENT_MAX_TASK_COUNT = 100
     _PUBLIC_AGENT_MAX_TOOL_COUNT = 100_000
@@ -6716,20 +6828,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 preview = self._public_execute_code_preview(tool_args.get("code"))
                 if preview is not None:
                     event["code_preview"], event["code_truncated"] = preview
+            if public_name == "memory":
+                event.update(self._public_memory_tool_fields(tool_args))
+            elif public_name == "skill_manage":
+                event.update(self._public_skill_tool_fields(tool_args))
             started_at[tool_call_id] = time.monotonic()
             _push(event)
 
-        def _complete(tool_call_id: Any, tool_name: Any, _tool_args: Any, _result: Any) -> None:
+        def _complete(tool_call_id: Any, tool_name: Any, tool_args: Any, result: Any) -> None:
             if not isinstance(tool_call_id, str) or tool_call_id not in started_at:
                 return
             started = started_at.pop(tool_call_id)
             public_name = self._public_run_tool_name(tool_name)
-            _push({
+            event = {
                 "event": "tool.completed", "run_id": run_id, "timestamp": time.time(),
                 "tool_call_id": tool_call_id, "tool": public_name,
                 "action_kind": self._public_run_action_kind(public_name),
                 "duration": round(time.monotonic() - started, 3),
-            })
+            }
+            target = self._public_run_tool_target(public_name, tool_args)
+            if target is not None:
+                event["target"], event["target_kind"] = target
+            if public_name == "memory":
+                event.update(self._public_memory_tool_fields(tool_args, result))
+            elif public_name == "skill_manage":
+                event.update(self._public_skill_tool_fields(tool_args, result))
+            _push(event)
 
         return _start, _complete
 
@@ -7266,6 +7390,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent._anton_run_id = run_id
                 self._active_run_agents[run_id] = agent
 
+                def _background_review_summary(message: Any) -> None:
+                    public = self._public_review_summary(message)
+                    if public is None:
+                        return
+                    self._emit_run_event(run_id, {
+                        **public,
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                    }, loop)
+
+                if not synthesize_only:
+                    agent.background_review_callback = _background_review_summary
+
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     # The Runs API is a browser/control-plane contract, not a
                     # privileged terminal transcript. Emit only its allowlisted
@@ -7561,6 +7698,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 }, loop)
                         except Exception:
                             logger.debug("Runs title generation failed", exc_info=True)
+                    review_thread = getattr(agent, "_background_review_thread", None)
+                    if isinstance(review_thread, threading.Thread) and review_thread.is_alive():
+                        # The answer and run status are already terminal. Keep only
+                        # the replay channel alive briefly for the late review card.
+                        await asyncio.to_thread(review_thread.join, 15.0)
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,

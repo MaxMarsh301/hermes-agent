@@ -894,6 +894,7 @@ def _run_review_in_thread(
         # action the fork DID complete before the crash. Coerce an
         # exception into an empty actions list so the partial valid
         # actions from earlier in the messages are returned instead.
+        summary_valid = True
         try:
             actions = summarize_background_review_actions(
                 review_messages,
@@ -901,6 +902,7 @@ def _run_review_in_thread(
                 notification_mode=getattr(agent, "memory_notifications", "on"),
             )
         except Exception as e:
+            summary_valid = False
             logger.warning(
                 "summarize_background_review_actions returned partial results "
                 "after exception (treating as empty); suppressing AttributeError "
@@ -920,6 +922,13 @@ def _run_review_in_thread(
                     _bg_cb(
                         f"💾 Self-improvement review: {summary}"
                     )
+                except Exception:
+                    pass
+        elif summary_valid and getattr(agent, "memory_notifications", "on") != "off":
+            _bg_cb = agent.background_review_callback
+            if _bg_cb:
+                try:
+                    _bg_cb("💾 Self-improvement review: No changes.")
                 except Exception:
                     pass
 

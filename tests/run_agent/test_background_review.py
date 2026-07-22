@@ -313,6 +313,37 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     )
 
 
+def test_background_review_reports_clean_no_change_completion(monkeypatch):
+    captured: list[str] = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    agent = _bare_agent()
+    agent.memory_notifications = "on"
+    agent.background_review_callback = captured.append
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hi"}],
+        review_memory=True,
+    )
+
+    assert captured == ["💾 Self-improvement review: No changes."]
+
+
 def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
     """The background review fork must NOT touch external memory plugins.
 
