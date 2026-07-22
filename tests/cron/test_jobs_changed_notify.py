@@ -8,11 +8,14 @@ the default path is unchanged.
 
 import pytest
 
+import cron.jobs as jobs
+
 
 @pytest.fixture
 def temp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    yield tmp_path
+    with jobs.use_cron_store(tmp_path):
+        yield tmp_path
 
 
 def test_notify_helper_calls_provider_on_jobs_changed(monkeypatch):
