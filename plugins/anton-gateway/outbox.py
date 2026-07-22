@@ -1,5 +1,6 @@
 from __future__ import annotations
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -91,6 +92,28 @@ class AntonOutbox:
             self._write(rows)
             return dict(item)
 
+    def create_or_confirm_same(self, record: dict) -> dict:
+        """Crash-safe immutable handoff; duplicate IDs must carry identical bytes."""
+        if not isinstance(record.get("deliveryId"), str) or not isinstance(record.get("payload"), dict):
+            raise ValueError("incomplete ANTON outbox record")
+        # Hash the exact canonical bytes the sender later signs and transmits.
+        from .client import canonical_json
+        payload_bytes = canonical_json(record["payload"])
+        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+        with self._locked():
+            rows = self._read()
+            for row in rows:
+                if row.get("deliveryId") == record["deliveryId"]:
+                    if row.get("payloadSha256") != payload_hash or row.get("payload") != record["payload"]:
+                        raise ValueError("payload hash conflict")
+                    return dict(row)
+            item = {**record, "payloadSha256": payload_hash, "state": "pending", "attempts": 0,
+                    "nextAttemptAt": self._iso(datetime.now(timezone.utc)), "errorCode": None,
+                    "leaseExpiresAt": None, "leaseToken": None, "leaseVersion": 0}
+            rows.append(item)
+            self._write(rows)
+            return dict(item)
+
     def create_and_claim(self, record: dict, now: datetime | None = None, lease_seconds: int = MIN_LEASE_SECONDS) -> dict:
         """Atomically persist an initial delivery and fence its first send."""
         required = {"deliveryId", "scheduleId", "executionId", "deliveryTarget", "payload"}
@@ -116,14 +139,14 @@ class AntonOutbox:
             self._write(rows)
             return claimed
 
-    def transition(self, delivery_id: str, *, expected_token: str, **changes) -> dict | None:
+    def transition(self, delivery_id: str, *, expected_token: str, expected_version: int | None = None, **changes) -> dict | None:
         """Settle an owned in-flight record, never a delivered/newer lease."""
         with self._locked():
             rows = self._read()
             for row in rows:
                 if row.get("deliveryId") != delivery_id:
                     continue
-                if row.get("state") != "in_flight" or row.get("leaseToken") != expected_token:
+                if row.get("state") != "in_flight" or row.get("leaseToken") != expected_token or (expected_version is not None and row.get("leaseVersion") != expected_version):
                     return None
                 # Payload and durable IDs are intentionally never transitionable.
                 forbidden = {"payload", "deliveryId", "scheduleId", "executionId", "deliveryTarget"}
@@ -163,14 +186,16 @@ class AntonOutbox:
             return result[:limit]
 
     def retry_or_dead_letter(self, delivery_id: str, expected_token: str, error_code: str,
-                             retryable: bool, max_attempts=5) -> dict | None:
+                             retryable: bool, max_attempts=5,
+                             expected_version: int | None = None) -> dict | None:
         """Release/dead-letter only the matching current lease."""
         with self._locked():
             rows = self._read()
             for row in rows:
                 if row.get("deliveryId") != delivery_id:
                     continue
-                if row.get("state") != "in_flight" or row.get("leaseToken") != expected_token:
+                if (row.get("state") != "in_flight" or row.get("leaseToken") != expected_token
+                        or (expected_version is not None and row.get("leaseVersion") != expected_version)):
                     return None
                 attempts = int(row.get("attempts", 0)) + 1
                 row.update(attempts=attempts, errorCode=error_code, leaseExpiresAt=None, leaseToken=None)

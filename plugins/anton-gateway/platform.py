@@ -36,7 +36,11 @@ async def send_payload(payload: dict, body: bytes | None = None):
     if not isinstance(delivery_id, str) or not delivery_id:
         raise ValueError("ANTON payload requires deliveryId")
     body = canonical_json(payload) if body is None else body
-    ack = _validate_ack(await AntonGatewayClient(AntonConfig.from_env()).deliver(payload, body), delivery_id)
+    client = AntonGatewayClient(AntonConfig.from_env())
+    if payload.get("message", {}).get("kind") == "delegation.result":
+        ack = _validate_ack(await client.deliver_delegation(payload, body), delivery_id)
+    else:
+        ack = _validate_ack(await client.deliver(payload, body), delivery_id)
     return {"success": True, "message_id": ack["messageId"], "raw_response": ack}
 
 
@@ -83,6 +87,7 @@ def retry_due(limit: int = 10) -> int:
     for record in outbox.due(limit=limit):
         payload = record["payload"]
         token = record["leaseToken"]
+        version = record["leaseVersion"]
         try:
             # The outbox is the source of truth: retry precisely this payload,
             # never regenerate it or re-run the scheduled agent.
@@ -90,12 +95,12 @@ def retry_due(limit: int = 10) -> int:
         except Exception as exc:
             outbox.retry_or_dead_letter(
                 record["deliveryId"], token, getattr(exc, "code", "delivery_failed"),
-                bool(getattr(exc, "retryable", False)),
+                bool(getattr(exc, "retryable", False)), expected_version=version,
             )
         else:
             if outbox.transition(
                 record["deliveryId"], expected_token=token,
-                state="delivered", errorCode=None, leaseExpiresAt=None,
+                expected_version=version, state="delivered", errorCode=None, leaseExpiresAt=None,
             ) is not None:
                 delivered += 1
     return delivered

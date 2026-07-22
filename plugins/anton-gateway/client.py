@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,7 +38,7 @@ def iso_timestamp(now: datetime | None = None) -> str:
 def _request_limit(purpose: str) -> int:
     if purpose == "resolver":
         return MAX_RESOLVER_REQUEST_BYTES
-    if purpose == "delivery":
+    if purpose in {"delivery", "delegation"}:
         return MAX_DELIVERY_REQUEST_BYTES
     raise ValueError("invalid ANTON request purpose")
 
@@ -47,8 +48,9 @@ def _retryable_status(status: int) -> bool:
 
 
 class AntonGatewayClient:
-    def __init__(self, config: AntonConfig, *, clock=None, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(self, config: AntonConfig, *, clock=None, transport: httpx.AsyncBaseTransport | None = None, nonce_factory=None):
         self.config, self._clock, self._transport = config, clock or (lambda: datetime.now(timezone.utc)), transport
+        self._nonce_factory = nonce_factory or (lambda: secrets.token_urlsafe(24))
         # Validate direct enabled AntonConfig construction too, not just environment loading.
         # A disabled client retains its established `disabled` transport error.
         self._base_url = (
@@ -62,6 +64,15 @@ class AntonGatewayClient:
         key = self.config.resolver_key if purpose == "resolver" else self.config.delivery_key
         key_id = self.config.resolver_key_id if purpose == "resolver" else self.config.delivery_key_id
         timestamp = iso_timestamp(self._clock())
+        if purpose == "delegation":
+            key, key_id = self.config.delegation_delivery_key, self.config.delegation_delivery_key_id
+            nonce = self._nonce_factory()
+            digest = hashlib.sha256(body).hexdigest()
+            preimage = "\n".join(("1", "POST", "/internal/anton-delegation-deliveries/v1", timestamp, nonce, digest)).encode("utf-8")
+            signature = hmac.new(key.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+            return {"Content-Type": "application/json", "X-AG-Key-Id": key_id, "X-AG-Timestamp": timestamp,
+                    "X-AG-Protocol-Version": "1", "X-AG-Nonce": nonce, "X-AG-Body-SHA256": digest,
+                    "X-AG-Signature": f"sha256={signature}"}
         # Gateway signs precisely this: no method/path prefix and no re-encoded body.
         signature = hmac.new(
             key.encode("utf-8"), timestamp.encode("utf-8") + b"\n" + body, hashlib.sha256
@@ -134,6 +145,11 @@ class AntonGatewayClient:
         return await self._post("resolver", "/internal/anton-resolver/v1/resolve", canonical_json(payload))
 
     async def deliver(self, payload: dict, body: bytes | None = None) -> dict[str, Any]:
-        return await self._post(
-            "delivery", "/internal/anton-cron-deliveries/v1", body if body is not None else canonical_json(payload)
-        )
+        return await self._post("delivery", "/internal/anton-cron-deliveries/v1", body if body is not None else canonical_json(payload))
+
+    async def deliver_delegation(self, payload: dict, body: bytes | None = None) -> dict[str, Any]:
+        # A leftover outbox record must not make the default-off feature emit
+        # a request signed with an empty or retired delegation key.
+        if not self.config.delegation_delivery_available():
+            raise AntonTransportError("delegation_disabled")
+        return await self._post("delegation", "/internal/anton-delegation-deliveries/v1", body if body is not None else canonical_json(payload))

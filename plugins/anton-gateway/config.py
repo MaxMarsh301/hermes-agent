@@ -70,6 +70,8 @@ class AntonConfig:
     delivery_key: str
     resolver_key_id: str
     delivery_key_id: str
+    delegation_delivery_key: str = ""
+    delegation_delivery_key_id: str = ""
     timeout: float = 10.0
     enabled: bool = False
     allow_insecure_http: bool = False
@@ -83,6 +85,8 @@ class AntonConfig:
             delivery_key=os.getenv("ANTON_CRON_DELIVERY_SECRET", ""),
             resolver_key_id=os.getenv("ANTON_RESOLVER_KEY_ID", ""),
             delivery_key_id=os.getenv("ANTON_CRON_DELIVERY_KEY_ID", ""),
+            delegation_delivery_key=os.getenv("ANTON_DELEGATION_DELIVERY_SECRET", ""),
+            delegation_delivery_key_id=os.getenv("ANTON_DELEGATION_DELIVERY_KEY_ID", ""),
             timeout=float(os.getenv("ANTON_GATEWAY_TIMEOUT", "10")),
             enabled=enabled,
             allow_insecure_http=_allow_insecure_http(),
@@ -97,3 +101,9 @@ class AntonConfig:
             except ValueError as exc:
                 raise ValueError("ANTON gateway enabled but configuration is incomplete") from exc
         return config
+
+    def delegation_delivery_available(self) -> bool:
+        """Feature-off is indistinguishable from absent; require a complete sink."""
+        return self.enabled and os.getenv("ANTON_DELEGATION_DELIVERY_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"} and bool(
+            self.base_url and self.delegation_delivery_key and self.delegation_delivery_key_id
+        )

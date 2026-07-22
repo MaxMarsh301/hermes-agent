@@ -4320,6 +4320,8 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        async_delivery: bool = False,
+        delegation_metadata: dict | None = None,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4343,7 +4345,8 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
-            async_delivery=False,
+            async_delivery=async_delivery,
+            delegation_metadata=delegation_metadata,
         )
 
     async def _run_agent(
@@ -5219,6 +5222,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Per-client model routing for /v1/runs (see model_routes).
         route = self._resolve_route(body.get("model"))
+        anton_async_delivery = False
+        delegation_metadata = {}
+        if trusted_anton_origin is not None:
+            try:
+                from hermes_plugins.anton_gateway.completion_sink import available, dispatch_metadata
+                anton_async_delivery = available(trusted_anton_origin)
+                delegation_metadata = dispatch_metadata(origin=trusted_anton_origin, parent_run_id=run_id,
+                    parent_session_id=str(session_id), profile="default") if anton_async_delivery else {}
+            except Exception:
+                anton_async_delivery, delegation_metadata = False, {}
 
         async def _run_and_close():
             try:
@@ -5333,7 +5346,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         # environment state.
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = self._bind_api_server_session(
-                            session_key=approval_session_key,
+                            session_key=approval_session_key, session_id=str(session_id),
+                            async_delivery=anton_async_delivery, delegation_metadata=delegation_metadata,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         agent.clarify_callback = _clarify_callback

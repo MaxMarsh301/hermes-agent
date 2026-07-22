@@ -419,6 +419,27 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
 
 
+def test_abandoned_delegation_preserves_handoff_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_recover_handoff", "session_key": "", "origin_ui_session_id": "",
+        "parent_session_id": "session-1", "dispatched_at": 1.0,
+        "delivery_metadata": {"origin": "anton", "deliveryTarget": "conversation_x", "parentRunId": "run-1", "parentSessionId": "session-1"},
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute("UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?", (99999999, record["delegation_id"]))
+    assert ad.recover_abandoned_delegations() == 1
+    restored = queue.Queue()
+    # A trusted ANTON terminal event is retained for its durable sink rather
+    # than being re-injected into the abandoned local session.
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    # The sink either accepts the immutable handoff immediately (when its
+    # plugin is loaded) or leaves it pending for a later startup retry.
+    assert ad.get_durable_delegation(record["delegation_id"])["delivery_state"] in {"pending", "delivered"}
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------

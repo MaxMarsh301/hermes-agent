@@ -108,7 +108,8 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            delivery_metadata_json TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -118,6 +119,7 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("delivery_metadata_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -142,12 +144,12 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?)""",
+                owner_started_at, task_json, delivery_metadata_json)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload)),
+             owner_started_at, json.dumps(task_payload), json.dumps(record.get("delivery_metadata") or {})),
         )
     _prune_durable_records()
 
@@ -228,11 +230,12 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json
+                      owner_started_at, task_json, delivery_metadata_json
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json = row
+            (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+             pid, started, task_json, delivery_metadata_json) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -248,6 +251,7 @@ def recover_abandoned_delegations() -> int:
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "delivery_metadata": json.loads(delivery_metadata_json or "{}"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -282,12 +286,31 @@ def restore_undelivered_completions(target_queue) -> int:
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
-            evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-            target_queue.put(evt)
-    return len(rows)
+    restored = 0
+    for delegation_id, payload in rows:
+        evt = json.loads(payload)
+        if not isinstance(evt, dict):
+            continue
+        metadata = evt.get("delivery_metadata")
+        if isinstance(metadata, dict) and metadata.get("origin") == "anton":
+            # ANTON is a durable sink, not a fallback to the dead local
+            # session.  Replay its persisted terminal event through the same
+            # claim -> immutable outbox -> acknowledgement sequence.  In
+            # particular, do not let a normal completion consumer mark it
+            # delivered while its signed handoff is unavailable during a key
+            # rotation or temporary filesystem outage.
+            claim_id = f"anton-recovery:{uuid.uuid4().hex}"
+            if claim_completion_delivery(delegation_id, claim_id):
+                try:
+                    from hermes_plugins.anton_gateway.completion_sink import handoff
+                    handoff(evt, claim_id)
+                except Exception:
+                    logger.exception("Async delegation %s ANTON recovery handoff failed", delegation_id)
+            continue
+        evt["restored"] = True
+        target_queue.put(evt)
+        restored += 1
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -484,6 +507,11 @@ def dispatch_async_delegation(
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
     delegation_id = _new_delegation_id()
+    try:
+        from gateway.session_context import delegation_delivery_metadata
+        delivery_metadata = delegation_delivery_metadata()
+    except Exception:
+        delivery_metadata = {}
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -495,6 +523,7 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
+        "delivery_metadata": delivery_metadata,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -615,6 +644,7 @@ def _push_completion_event(
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "delivery_metadata": record.get("delivery_metadata") or {},
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -632,14 +662,23 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     _persist_completion(evt, result)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+    if evt.get("delivery_metadata"):
+        try:
+            from hermes_plugins.anton_gateway.completion_sink import handoff
+            claim_id = f"anton-handoff:{uuid.uuid4().hex}"
+            if claim_completion_delivery(str(record.get("delegation_id") or ""), claim_id):
+                handoff(evt, claim_id=claim_id)
+        except Exception:
+            logger.exception("Async delegation %s durable ANTON handoff failed", record.get("delegation_id"))
+    if not (isinstance(evt.get("delivery_metadata"), dict)
+            and evt["delivery_metadata"].get("origin") == "anton"):
+        try:
+            process_registry.completion_queue.put(evt)
+        except Exception as exc:  # pragma: no cover
+            logger.error(
+                "Async delegation %s: failed to enqueue completion event; result lost: %s",
+                record.get("delegation_id"), exc,
+            )
 
 
 def dispatch_async_delegation_batch(
@@ -677,6 +716,11 @@ def dispatch_async_delegation_batch(
     capacity.
     """
     delegation_id = _new_delegation_id()
+    try:
+        from gateway.session_context import delegation_delivery_metadata
+        delivery_metadata = delegation_delivery_metadata()
+    except Exception:
+        delivery_metadata = {}
     dispatched_at = time.time()
     n = len(goals)
     # A combined goal label for status listings / the completion header.
@@ -694,6 +738,7 @@ def dispatch_async_delegation_batch(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
+        "delivery_metadata": delivery_metadata,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -794,6 +839,7 @@ def _finalize_batch(
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "delivery_metadata": event_record.get("delivery_metadata") or {},
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -811,12 +857,21 @@ def _finalize_batch(
         "completed_at": completed_at,
     }
     _persist_completion(evt, combined)
+    if evt.get("delivery_metadata"):
+        try:
+            from hermes_plugins.anton_gateway.completion_sink import handoff
+            claim_id = f"anton-handoff:{uuid.uuid4().hex}"
+            if claim_completion_delivery(delegation_id, claim_id):
+                handoff(evt, claim_id=claim_id)
+        except Exception:
+            logger.exception("Async delegation %s durable ANTON handoff failed", delegation_id)
     try:
-        process_registry.completion_queue.put(evt)
+        if not (isinstance(evt.get("delivery_metadata"), dict)
+                and evt["delivery_metadata"].get("origin") == "anton"):
+            process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "Async delegation batch %s: failed to enqueue completion event; result lost: %s",
             delegation_id, exc,
         )
     finally:

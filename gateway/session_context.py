@@ -113,6 +113,7 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+_SESSION_DELEGATION_METADATA: ContextVar = ContextVar("HERMES_SESSION_DELEGATION_METADATA", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -169,6 +170,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    delegation_metadata: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -204,6 +206,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_DELEGATION_METADATA.set(delegation_metadata),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -245,6 +248,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_DELEGATION_METADATA.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -293,6 +297,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_DELEGATION_METADATA.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -344,3 +349,8 @@ def async_delivery_supported() -> bool:
     if value is _UNSET:
         return True
     return bool(value)
+
+
+def delegation_delivery_metadata() -> dict:
+    value = _SESSION_DELEGATION_METADATA.get()
+    return dict(value) if isinstance(value, dict) else {}

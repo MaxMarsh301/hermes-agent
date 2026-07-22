@@ -1,4 +1,5 @@
 import importlib.util
+import queue
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -163,6 +164,18 @@ def test_delivery_ack_rejects_malformed_required_fields(ack):
         platform._validate_ack(ack, "delivery-fixed")
 
 
+def _enable_delegation_sink(monkeypatch):
+    monkeypatch.setenv("ANTON_GATEWAY_ENABLED", "true")
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_ENABLED", "true")
+    monkeypatch.setenv("ANTON_GATEWAY_URL", "https://gateway.example")
+    monkeypatch.setenv("ANTON_RESOLVER_KEY_ID", "resolver-v1")
+    monkeypatch.setenv("ANTON_RESOLVER_SECRET", "resolver-secret")
+    monkeypatch.setenv("ANTON_CRON_DELIVERY_KEY_ID", "delivery-v1")
+    monkeypatch.setenv("ANTON_CRON_DELIVERY_SECRET", "delivery-secret")
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_KEY_ID", "delegation-v1")
+    monkeypatch.setenv("ANTON_DELEGATION_DELIVERY_SECRET", "delegation-secret")
+
+
 def _enabled_client(client_module, config_module, transport, *, base_url="https://gateway.example"):
     return client_module.AntonGatewayClient(
         config_module.AntonConfig(
@@ -283,3 +296,163 @@ async def test_http_status_retry_classification(status, retryable):
         await client.resolve({"reference": "anton:project_x"})
     assert error.value.code == f"http_{status}"
     assert error.value.retryable is retryable
+
+
+def test_delegation_outbox_is_immutable_and_fences_stale_leases(tmp_path):
+    plugin = load_plugin()
+    import importlib
+    Outbox = importlib.import_module(plugin.__name__ + ".outbox").AntonOutbox
+    outbox = Outbox(tmp_path / "outbox.json")
+    payload = {"schemaVersion": "1", "deliveryId": "delegation:d1:terminal"}
+    first = outbox.create_or_confirm_same({
+        "deliveryId": "delegation:d1:terminal", "deliveryType": "delegation.result",
+        "payload": payload,
+    })
+    assert first["payloadSha256"]
+    assert outbox.create_or_confirm_same({
+        "deliveryId": "delegation:d1:terminal", "deliveryType": "delegation.result",
+        "payload": payload,
+    })["deliveryId"] == first["deliveryId"]
+    with pytest.raises(ValueError, match="payload hash conflict"):
+        outbox.create_or_confirm_same({"deliveryId": "delegation:d1:terminal", "deliveryType": "delegation.result", "payload": {"changed": True}})
+    old = outbox.due()[0]
+    outbox.transition(old["deliveryId"], expected_token=old["leaseToken"], leaseExpiresAt="2000-01-01T00:00:00+00:00")
+    new = outbox.due()[0]
+    assert new["leaseVersion"] > old["leaseVersion"]
+    assert outbox.transition(old["deliveryId"], expected_token=old["leaseToken"], state="delivered") is None
+
+
+def test_delegation_headers_bind_exact_method_path_nonce_and_digest():
+    plugin = load_plugin()
+    import importlib
+    client_module = importlib.import_module(plugin.__name__ + ".client")
+    config_module = importlib.import_module(plugin.__name__ + ".config")
+    client = client_module.AntonGatewayClient(config_module.AntonConfig(
+        base_url="https://gateway.example", resolver_key="r", delivery_key="c",
+        resolver_key_id="r1", delivery_key_id="c1", delegation_delivery_key="d",
+        delegation_delivery_key_id="d1", enabled=True,
+    ), clock=lambda: datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc), nonce_factory=lambda: "a" * 32)
+    headers = client._headers("delegation", b'{"x":1}')
+    assert headers["X-AG-Protocol-Version"] == "1"
+    assert headers["X-AG-Nonce"] == "a" * 32
+    assert headers["X-AG-Body-SHA256"] == "5041bf1f713df204784353e82f6a4a535931cb64f1f4b4a5aeaffcb720918b22"
+
+
+def test_disabled_delegation_sink_does_not_enqueue_stale_handoff(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("ANTON_DELEGATION_DELIVERY_ENABLED", raising=False)
+    plugin = load_plugin()
+    import importlib
+    sink = importlib.import_module(plugin.__name__ + ".completion_sink")
+    outbox_module = importlib.import_module(plugin.__name__ + ".outbox")
+    from tools import async_delegation as ad
+
+    metadata = {"origin": "anton", "deliveryTarget": "conversation_x", "parentRunId": "run-1", "parentSessionId": "session-1"}
+    event = {"delegation_id": "deleg_disabled", "status": "completed", "completed_at": 2.0, "delivery_metadata": metadata}
+    ad._persist_dispatch({"delegation_id": "deleg_disabled", "session_key": "", "origin_ui_session_id": "", "parent_session_id": "session-1", "dispatched_at": 1.0, "delivery_metadata": metadata})
+    ad._persist_completion(event, {"status": "completed"})
+    assert ad.claim_completion_delivery("deleg_disabled", "disabled-claim")
+    assert not sink.handoff(event, "disabled-claim")
+    assert outbox_module.AntonOutbox()._read() == []
+    assert ad.claim_completion_delivery("deleg_disabled", "enabled-later")
+
+
+@pytest.mark.asyncio
+async def test_delegation_delivery_is_default_off(monkeypatch):
+    plugin = load_plugin()
+    import importlib
+    client_module = importlib.import_module(plugin.__name__ + ".client")
+    config_module = importlib.import_module(plugin.__name__ + ".config")
+    client = client_module.AntonGatewayClient(config_module.AntonConfig(
+        base_url="https://gateway.example", resolver_key="r", delivery_key="c",
+        resolver_key_id="r1", delivery_key_id="c1", delegation_delivery_key="d",
+        delegation_delivery_key_id="d1", enabled=True,
+    ))
+    monkeypatch.delenv("ANTON_DELEGATION_DELIVERY_ENABLED", raising=False)
+    with pytest.raises(client_module.AntonTransportError, match="delegation_disabled"):
+        await client.deliver_delegation({"deliveryId": "delegation:d1:terminal"})
+
+
+def test_delegation_handoff_persists_deterministic_outbox_before_ack(tmp_path, monkeypatch):
+    """A retry after a crash confirms the same record rather than changing it."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _enable_delegation_sink(monkeypatch)
+    plugin = load_plugin()
+    import importlib
+    sink = importlib.import_module(plugin.__name__ + ".completion_sink")
+    outbox_module = importlib.import_module(plugin.__name__ + ".outbox")
+    from tools import async_delegation as ad
+
+    record = {
+        "delegation_id": "deleg_handoff", "session_key": "", "origin_ui_session_id": "",
+        "parent_session_id": "session-1", "dispatched_at": 1.0,
+        "delivery_metadata": {
+            "origin": "anton", "deliveryTarget": "conversation_0123456789abcdef0123456789abcdef",
+            "parentRunId": "run-1", "parentSessionId": "session-1",
+        },
+    }
+    event = {
+        "type": "async_delegation", "delegation_id": "deleg_handoff", "status": "completed",
+        "summary": "done", "completed_at": 2.0, "delivery_metadata": record["delivery_metadata"],
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    assert ad.claim_completion_delivery("deleg_handoff", "claim-1")
+    assert sink.handoff(event, "claim-1")
+    assert ad.get_durable_delegation("deleg_handoff")["delivery_state"] == "delivered"
+
+    saved = outbox_module.AntonOutbox()._read()
+    assert len(saved) == 1 and saved[0]["state"] == "pending"
+    assert saved[0]["payload"]["occurredAt"] == "1970-01-01T00:00:02+00:00"
+    # A process that died after writing the outbox but before ledger ACK may
+    # repeat only this immutable payload and must not create a conflict.
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    assert ad.claim_completion_delivery("deleg_handoff", "claim-2")
+    assert sink.handoff(event, "claim-2")
+    assert len(outbox_module.AntonOutbox()._read()) == 1
+
+
+def test_delegation_handoff_failure_releases_claim_and_startup_retries_sink(tmp_path, monkeypatch):
+    """An outbox failure cannot strand or locally reroute an ANTON completion."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _enable_delegation_sink(monkeypatch)
+    plugin = load_plugin()
+    import importlib
+    sink = importlib.import_module(plugin.__name__ + ".completion_sink")
+    outbox_module = importlib.import_module(plugin.__name__ + ".outbox")
+    from tools import async_delegation as ad
+
+    metadata = {
+        "origin": "anton", "deliveryTarget": "conversation_0123456789abcdef0123456789abcdef",
+        "parentRunId": "run-1", "parentSessionId": "session-1",
+    }
+    event = {
+        "type": "async_delegation", "delegation_id": "deleg_retry_handoff",
+        "status": "completed", "summary": "done", "completed_at": 2.0,
+        "delivery_metadata": metadata,
+    }
+    ad._persist_dispatch({
+        "delegation_id": event["delegation_id"], "session_key": "", "origin_ui_session_id": "",
+        "parent_session_id": "session-1", "dispatched_at": 1.0, "delivery_metadata": metadata,
+    })
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+
+    class BrokenOutbox:
+        def create_or_confirm_same(self, _record):
+            raise OSError("disk unavailable")
+
+    assert ad.claim_completion_delivery(event["delegation_id"], "failed-claim")
+    monkeypatch.setattr(sink, "AntonOutbox", BrokenOutbox)
+    with pytest.raises(OSError, match="disk unavailable"):
+        sink.handoff(event, "failed-claim")
+    # Claim release makes recovery immediate rather than waiting for its lease.
+    assert ad.claim_completion_delivery(event["delegation_id"], "retry-claim")
+    assert ad.release_completion_delivery(event["delegation_id"], "retry-claim")
+
+    monkeypatch.setattr(sink, "AntonOutbox", outbox_module.AntonOutbox)
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    saved = outbox_module.AntonOutbox()._read()
+    assert len(saved) == 1 and saved[0]["deliveryId"] == "delegation:deleg_retry_handoff:terminal"
