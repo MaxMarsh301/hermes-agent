@@ -2183,6 +2183,10 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
+    async def _ensure_session_db_async(self):
+        """Resolve or initialize the profile SessionDB off the aiohttp loop."""
+        return await asyncio.to_thread(self._ensure_session_db)
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -6161,11 +6165,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if fingerprint == self._run_persisted_fingerprints.get(run_id):
             if terminal or now - self._run_persisted_at.get(run_id, 0) < self._RUN_PERSIST_HEARTBEAT_SECONDS:
                 return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Callback threads cannot schedule SQLite work; the next loop-side
+            # semantic transition/heartbeat will persist the snapshot.
+            return
         self._run_persisted_fingerprints[run_id] = fingerprint
         self._run_persisted_at[run_id] = now
-        db = self._ensure_session_db()
-        if db is None:
-            return
 
         async def _write(previous: Optional["asyncio.Task"]) -> None:
             if previous is not None:
@@ -6174,6 +6181,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             try:
+                db = await self._ensure_session_db_async()
+                if db is None:
+                    return
                 await asyncio.to_thread(
                     db.save_api_run, run_id, str(logical_id),
                     str(current.get("effective_session_id") or logical_id),
@@ -6182,12 +6192,6 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("Could not persist public run status", exc_info=True)
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Callback threads cannot run SQLite work; the next loop-side
-            # semantic transition/heartbeat will persist the snapshot.
-            return
         previous = self._run_persist_tails.get(run_id)
         task = loop.create_task(_write(previous))
         self._run_persist_tails[run_id] = task
@@ -7253,19 +7257,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 trusted_anton_origin = bind_parent_run(trusted_anton_origin, run_id)
             except Exception:
                 return web.json_response(_openai_error("Invalid ANTON origin"), status=403)
-        db = self._ensure_session_db()
+        db = await self._ensure_session_db_async()
         context_state = None
         if context_mode:
             if db is None:
                 return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
-            context_state = db.get_or_create_context_state(logical_session_id, effective_session_id=session_id)
+            context_state = await asyncio.to_thread(
+                db.get_or_create_context_state,
+                logical_session_id,
+                effective_session_id=session_id,
+            )
             if int(context_state["revision"]) != expected_revision:
                 return web.json_response(_openai_error("Context revision conflict", code="context_revision_conflict"), status=409)
             session_id = context_state["effective_session_id"]
             if context_mode == "session" or (context_mode == "bootstrap" and expected_revision != 0):
                 # Restore the active Hermes conversation projection rather than
                 # passing storage rows (ids, timestamps, internal columns) to an agent.
-                conversation_history = db.get_messages_as_conversation(session_id)
+                conversation_history = await asyncio.to_thread(
+                    db.get_messages_as_conversation, session_id,
+                )
         idem_key = request.headers.get("Idempotency-Key", "").strip()
         # Signed synthesize-only continuations were already fenced above by
         # claim_anton_synthesis() using their required delivery-scoped key.
@@ -7274,8 +7284,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if idem_key and continuation_idempotency_key is None:
             if len(idem_key) > 256 or db is None or not gateway_session_key:
                 return web.json_response(_openai_error("Idempotency-Key requires a valid session scope", code="invalid_idempotency_key"), status=400)
-            outcome, previous_run = db.reserve_api_run_idempotency(
-                gateway_session_key, idem_key, hashlib.sha256(raw_body).hexdigest(), run_id,
+            outcome, previous_run = await asyncio.to_thread(
+                db.reserve_api_run_idempotency,
+                gateway_session_key,
+                idem_key,
+                hashlib.sha256(raw_body).hexdigest(),
+                run_id,
                 logical_session_id=logical_session_id or session_id,
                 effective_session_id=session_id,
                 revision=int(context_state["revision"]) if context_state else 0,
@@ -7283,7 +7297,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if outcome == "conflict":
                 return web.json_response(_openai_error("Idempotency-Key was used with a different request", code="idempotency_key_conflict"), status=409)
             if outcome == "existing":
-                previous = self._run_statuses.get(previous_run) or db.get_api_run(previous_run) or {}
+                previous = self._run_statuses.get(previous_run)
+                if previous is None:
+                    previous = await asyncio.to_thread(db.get_api_run, previous_run)
+                previous = previous or {}
                 if previous_run in self._active_run_tasks or str(previous.get("status") or "") in {"completed", "failed", "cancelled", "stopped"}:
                     return web.json_response({"run_id": previous_run, "status": previous.get("status", "accepted")}, status=202)
                 # Previous process died after durable reservation. Recreate the
@@ -7974,12 +7991,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if status is None:
             # A recreated adapter has no process map. Only terminal, public
             # synthesize-only status is retained in this durable table.
-            status = self._response_store.get_anton_synthesis_status(run_id)
+            status = await asyncio.to_thread(
+                self._response_store.get_anton_synthesis_status, run_id,
+            )
             if status is not None:
                 self._run_statuses[run_id] = status
         if status is None:
-            db = self._ensure_session_db()
-            persisted = db.get_api_run(run_id) if db is not None else None
+            db = await self._ensure_session_db_async()
+            persisted = await asyncio.to_thread(db.get_api_run, run_id) if db is not None else None
             if persisted is not None:
                 return web.json_response({"object": "hermes.run", "run_id": run_id, "status": persisted["status"], "logical_session_id": persisted["logical_session_id"], "effective_session_id": persisted["effective_session_id"], "context_revision": persisted["revision"], "created_at": persisted["created_at"], "updated_at": persisted["updated_at"]})
             return web.json_response(
@@ -8200,12 +8219,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": True,
         })
 
-    def _run_control_record(self, run_id: str) -> Optional[Dict[str, Any]]:
+    async def _run_control_record(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Return one run-control record without blocking the aiohttp loop."""
         status = self._run_statuses.get(run_id)
         if status is not None:
             return status
-        db = self._ensure_session_db()
-        persisted = db.get_api_run(run_id) if db is not None else None
+        db = await self._ensure_session_db_async()
+        persisted = await asyncio.to_thread(db.get_api_run, run_id) if db is not None else None
         if persisted is None:
             return None
         return {
@@ -8222,7 +8242,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         run_id = request.match_info["run_id"]
-        status = self._run_control_record(run_id)
+        status = await self._run_control_record(run_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404,
@@ -8293,7 +8313,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         parent_run_id = request.match_info["run_id"]
-        parent = self._run_control_record(parent_run_id)
+        parent = await self._run_control_record(parent_run_id)
         if parent is None:
             return web.json_response(
                 _openai_error(f"Run not found: {parent_run_id}", code="run_not_found"), status=404,
@@ -8348,12 +8368,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Invalid Idempotency-Key", code="invalid_idempotency_key"), status=400,
             )
         logical_id = str(parent.get("logical_session_id") or parent.get("session_id") or "")
+        db = await self._ensure_session_db_async()
+        if db is None:
+            self._run_files.delete_queue_snapshot(item_id)
+            return web.json_response(
+                _openai_error("Run queue storage unavailable", code="queue_unavailable"), status=503,
+            )
         digest = hashlib.sha256(json.dumps(
             {"content": content, "attachments": attachment_ids},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
         try:
-            outcome, item = self._ensure_session_db().reserve_api_queue_item(
+            outcome, item = await asyncio.to_thread(
+                db.reserve_api_queue_item,
                 item_id=item_id,
                 parent_run_id=parent_run_id,
                 logical_session_id=logical_id,
@@ -8378,31 +8405,40 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(
                 _openai_error("Idempotency key request conflict", code="idempotency_conflict"), status=409,
             )
-        queued = [row for row in self._ensure_session_db().list_api_queue_items(logical_id) if row.get("state") == "queued"]
+        queue_rows = await asyncio.to_thread(db.list_api_queue_items, logical_id)
+        queued = [row for row in queue_rows if row.get("state") == "queued"]
         position = next((index + 1 for index, row in enumerate(queued) if row["item_id"] == item["item_id"]), None)
-        latest_parent = self._run_control_record(parent_run_id)
+        latest_parent = await self._run_control_record(parent_run_id)
         if latest_parent and latest_parent.get("status") in {"completed", "failed", "cancelled", "stopped"}:
             self._schedule_api_queue_dispatch(logical_id)
         return web.json_response(
             self._public_queue_item(item, position), status=202 if outcome == "created" else 200,
         )
 
-    def _queue_parent_and_items(self, run_id: str) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-        parent = self._run_control_record(run_id)
+    async def _queue_parent_and_items(self, run_id: str) -> tuple[Optional[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+        parent = await self._run_control_record(run_id)
         if parent is None:
             return None, []
         logical_id = str(parent.get("logical_session_id") or parent.get("session_id") or "")
-        return parent, self._ensure_session_db().list_api_queue_items(logical_id)
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return parent, None
+        items = await asyncio.to_thread(db.list_api_queue_items, logical_id)
+        return parent, items
 
     async def _handle_list_run_queue(self, request: "web.Request") -> "web.Response":
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         run_id = request.match_info["run_id"]
-        parent, items = self._queue_parent_and_items(run_id)
+        parent, items = await self._queue_parent_and_items(run_id)
         if parent is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404,
+            )
+        if items is None:
+            return web.json_response(
+                _openai_error("Run queue storage unavailable", code="queue_unavailable"), status=503,
             )
         queued_position = 0
         data = []
@@ -8418,14 +8454,19 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        parent = self._run_control_record(request.match_info["run_id"])
+        parent = await self._run_control_record(request.match_info["run_id"])
         if parent is None:
             return web.json_response(
                 _openai_error("Run not found", code="run_not_found"), status=404,
             )
         logical_id = str(parent.get("logical_session_id") or parent.get("session_id") or "")
         item_id = request.match_info["item_id"]
-        outcome = self._ensure_session_db().cancel_api_queue_item(logical_id, item_id)
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Run queue storage unavailable", code="queue_unavailable"), status=503,
+            )
+        outcome = await asyncio.to_thread(db.cancel_api_queue_item, logical_id, item_id)
         if outcome == "missing":
             return web.json_response(
                 _openai_error("Queue item not found", code="queue_item_not_found"), status=404,
@@ -8435,7 +8476,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Queue item is already dispatching or terminal", code="queue_item_not_cancellable"), status=409,
             )
         self._run_files.delete_queue_snapshot(item_id)
-        item = self._ensure_session_db().get_api_queue_item(item_id)
+        item = await asyncio.to_thread(db.get_api_queue_item, item_id)
         return web.json_response(self._public_queue_item(item or {"item_id": item_id, "state": "cancelled"}))
 
     def _schedule_api_queue_dispatch(self, logical_id: str) -> None:
@@ -8453,25 +8494,34 @@ class APIServerAdapter(BasePlatformAdapter):
         """Single deterministic coordinator for one logical session."""
         lock = self._queue_locks.setdefault(logical_id, asyncio.Lock())
         async with lock:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                logger.warning("[api_server] queue storage unavailable for %s", logical_id)
+                return
             while True:
-                item = self._ensure_session_db().claim_next_api_queue_item(logical_id)
+                item = await asyncio.to_thread(
+                    db.claim_next_api_queue_item, logical_id,
+                )
                 if item is None:
                     return
                 await self._dispatch_api_queue_item(item)
 
     async def _dispatch_api_queue_item(self, item: Dict[str, Any]) -> None:
-        db = self._ensure_session_db()
         item_id = item["item_id"]
         run_id = item["dispatch_run_id"]
         logical_id = item["logical_session_id"]
+        db = await self._ensure_session_db_async()
+        if db is None:
+            logger.error("[api_server] queue storage unavailable for dispatch %s", item_id)
+            return
         context_lock = self._context_lock(logical_id)
         self._active_run_tasks[run_id] = asyncio.current_task()
-        db.set_api_queue_item_state(item_id, "running")
+        await asyncio.to_thread(db.set_api_queue_item_state, item_id, "running")
         try:
             async with context_lock:
-                state = db.get_or_create_context_state(logical_id)
+                state = await asyncio.to_thread(db.get_or_create_context_state, logical_id)
                 effective_id = state["effective_session_id"]
-                history = db.get_messages_as_conversation(effective_id)
+                history = await asyncio.to_thread(db.get_messages_as_conversation, effective_id)
                 content = self._run_files.queued_multimodal_parts(
                     item_id, item.get("content"), item.get("attachment_snapshot"),
                 )
@@ -8489,7 +8539,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     tracked_run_id=run_id,
                 )
                 resulting_id = result.get("session_id", effective_id) if isinstance(result, dict) else effective_id
-                advanced = db.advance_context_state(
+                advanced = await asyncio.to_thread(
+                    db.advance_context_state,
                     logical_id,
                     expected_revision=int(state["revision"]),
                     effective_session_id=resulting_id,
@@ -8500,7 +8551,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(result, dict) and result.get("failed"):
                     raise RuntimeError("queued agent run failed")
                 output = result.get("final_response", "") if isinstance(result, dict) else ""
-                db.finish_api_queue_dispatch(
+                await asyncio.to_thread(
+                    db.finish_api_queue_dispatch,
                     item_id,
                     run_id=run_id,
                     logical_session_id=logical_id,
@@ -8514,12 +8566,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     context_revision=advanced["revision"],
                 )
         except asyncio.CancelledError:
-            db.set_api_queue_item_state(item_id, "queued")
+            await asyncio.to_thread(db.set_api_queue_item_state, item_id, "queued")
             raise
         except Exception:
             logger.exception("[api_server] queued run dispatch failed for %s", item_id)
             current = self._run_statuses.get(run_id, {})
-            db.finish_api_queue_dispatch(
+            await asyncio.to_thread(
+                db.finish_api_queue_dispatch,
                 item_id,
                 run_id=run_id,
                 logical_session_id=logical_id,
@@ -8531,11 +8584,16 @@ class APIServerAdapter(BasePlatformAdapter):
         finally:
             self._active_run_agents.pop(run_id, None)
             self._active_run_tasks.pop(run_id, None)
-            if db.get_api_queue_item(item_id).get("state") in {"completed", "failed", "cancelled"}:
+            final_item = await asyncio.to_thread(db.get_api_queue_item, item_id)
+            if final_item and final_item.get("state") in {"completed", "failed", "cancelled"}:
                 self._run_files.delete_queue_snapshot(item_id)
 
     async def _recover_api_run_queue(self) -> None:
-        for logical_id in self._ensure_session_db().recover_api_run_queue():
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return
+        logical_ids = await asyncio.to_thread(db.recover_api_run_queue)
+        for logical_id in logical_ids:
             self._schedule_api_queue_dispatch(logical_id)
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":

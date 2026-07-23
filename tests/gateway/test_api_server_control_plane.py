@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -283,6 +284,32 @@ async def test_durable_queue_lists_cancels_and_dispatches_after_terminal(control
     assert db.get_api_queue_item(first_body["itemId"])["state"] == "completed"
     assert db.get_api_queue_item(second_id)["state"] == "cancelled"
     assert adapter._run_agent.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_list_sqlite_wait_does_not_block_event_loop(control_plane, monkeypatch):
+    adapter, db = control_plane
+    adapter._run_statuses["parent-slow-db"] = {
+        "status": "running",
+        "logical_session_id": "logical-slow-db",
+        "effective_session_id": "logical-slow-db",
+    }
+    original = db.list_api_queue_items
+
+    def slow_list(logical_session_id):
+        time.sleep(0.15)
+        return original(logical_session_id)
+
+    monkeypatch.setattr(db, "list_api_queue_items", slow_list)
+    queue_read = asyncio.create_task(adapter._queue_parent_and_items("parent-slow-db"))
+    started = time.monotonic()
+    await asyncio.sleep(0.02)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.10
+    parent, items = await queue_read
+    assert parent["logical_session_id"] == "logical-slow-db"
+    assert items == []
 
 
 @pytest.mark.asyncio

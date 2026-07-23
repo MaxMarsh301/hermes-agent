@@ -1082,6 +1082,10 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._fts_maintenance_lock = threading.Lock()
+        self._fts_maintenance_state_lock = threading.Lock()
+        self._fts_maintenance_thread: Optional[threading.Thread] = None
+        self._fts_maintenance_due = False
+        self._fts_closed = False
         self._write_count = 0
         self._fts_write_count = 0
         self._fts_enabled = False
@@ -1350,18 +1354,17 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                # Success — periodic best-effort checkpoint + deferred FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
                 changed_fts = fts_mutated(result) if callable(fts_mutated) else fts_mutated
                 if changed_fts:
-                    self._fts_write_count += 1
-                    if self._fts_write_count >= self._FTS_MERGE_EVERY_N_WRITES:
-                        # Reset only after a completed pass. Busy/errors leave
-                        # maintenance due for the next message mutation.
-                        if self._try_merge_fts():
-                            self._fts_write_count = 0
+                    with self._fts_maintenance_state_lock:
+                        self._fts_write_count += 1
+                        if self._fts_write_count >= self._FTS_MERGE_EVERY_N_WRITES:
+                            self._fts_maintenance_due = True
+                    self._schedule_fts_merge()
                 return result
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -1414,10 +1417,9 @@ class SessionDB:
     def _try_merge_fts(self) -> bool:
         """Run one bounded, best-effort FTS5 merge pass; never raise.
 
-        This synchronous path deliberately has no background thread: SessionDB
-        owns a sqlite connection and cannot safely outlive callers. The caller
-        invokes it only after commit and outside ``_lock``. A separate lock
-        prevents two maintenance passes on the same SessionDB from overlapping.
+        The dedicated maintenance worker calls this after the user transaction
+        commits. ``check_same_thread=False`` plus ``self._lock`` serialize access
+        to the owned connection; ``close()`` joins the worker before closing it.
         """
         if not self._fts_maintenance_lock.acquire(blocking=False):
             logger.debug("FTS incremental merge skipped: maintenance already running")
@@ -1451,12 +1453,66 @@ class SessionDB:
         finally:
             self._fts_maintenance_lock.release()
 
+    def _schedule_fts_merge(self) -> None:
+        """Start at most one deferred FTS worker when message maintenance is due."""
+        with self._fts_maintenance_state_lock:
+            if self._fts_closed or not self._fts_maintenance_due:
+                return
+            current = self._fts_maintenance_thread
+            if current is not None and current.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._run_fts_maintenance,
+                name=f"hermes-fts-merge-{id(self):x}",
+                daemon=True,
+            )
+            self._fts_maintenance_thread = worker
+            worker.start()
+
+    def _run_fts_maintenance(self) -> None:
+        """Run bounded merge passes off caller and HTTP threads."""
+        try:
+            while True:
+                with self._fts_maintenance_state_lock:
+                    if self._fts_closed or not self._fts_maintenance_due:
+                        return
+                    covered_writes = self._fts_write_count
+                    self._fts_maintenance_due = False
+                if not self._try_merge_fts():
+                    with self._fts_maintenance_state_lock:
+                        if not self._fts_closed:
+                            self._fts_maintenance_due = True
+                    return
+                with self._fts_maintenance_state_lock:
+                    self._fts_write_count = max(0, self._fts_write_count - covered_writes)
+                    self._fts_maintenance_due = (
+                        self._fts_write_count >= self._FTS_MERGE_EVERY_N_WRITES
+                    )
+        finally:
+            with self._fts_maintenance_state_lock:
+                if self._fts_maintenance_thread is threading.current_thread():
+                    self._fts_maintenance_thread = None
+
+    def _wait_for_fts_maintenance(self, timeout: Optional[float] = None) -> bool:
+        """Wait for an already-started maintenance pass; used by close and tests."""
+        with self._fts_maintenance_state_lock:
+            worker = self._fts_maintenance_thread
+        if worker is None or worker is threading.current_thread():
+            return True
+        worker.join(timeout)
+        return not worker.is_alive()
+
     def close(self):
         """Close the database connection.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        Stop and join deferred FTS work before closing the shared connection,
+        then attempt a final TRUNCATE checkpoint.
         """
+        with self._fts_maintenance_state_lock:
+            self._fts_closed = True
+            self._fts_maintenance_due = False
+        if not self._wait_for_fts_maintenance(timeout=5.0):
+            logger.warning("FTS maintenance worker did not stop before close timeout")
         with self._lock:
             if self._conn:
                 try:

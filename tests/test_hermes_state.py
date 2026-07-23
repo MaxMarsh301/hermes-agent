@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
 import json
 import pytest
@@ -4740,6 +4741,7 @@ class TestOptimizeFts:
         db.append_message(session_id="s1", role="user", content="needle one")
         assert calls == []
         db.append_message(session_id="s1", role="user", content="needle two")
+        assert db._wait_for_fts_maintenance(1.0)
         assert calls == [True]
         assert db._fts_write_count == 0
         assert len(db.search_messages("needle")) == 2
@@ -4751,12 +4753,14 @@ class TestOptimizeFts:
         monkeypatch.setattr(db, "_try_merge_fts", lambda: calls.append(True) and False)
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="still persists")
+        assert db._wait_for_fts_maintenance(1.0)
         assert len(db.get_messages("s1")) == 1
         assert calls == [True]
         assert db._fts_write_count == 1
 
         monkeypatch.setattr(db, "_try_merge_fts", lambda: True)
         db.append_message(session_id="s1", role="user", content="retry merge")
+        assert db._wait_for_fts_maintenance(1.0)
         assert db._fts_write_count == 0
 
     def test_incremental_merge_skips_missing_trigram_table(self, db):
@@ -4778,10 +4782,35 @@ class TestOptimizeFts:
         assert db._fts_maintenance_lock.acquire(blocking=False)
         try:
             db.append_message(session_id="s1", role="user", content="deferred")
+            assert db._wait_for_fts_maintenance(1.0)
             assert db._fts_write_count == 1
         finally:
             db._fts_maintenance_lock.release()
         db.append_message(session_id="s1", role="user", content="runs now")
+        assert db._wait_for_fts_maintenance(1.0)
+        assert db._fts_write_count == 0
+
+    def test_incremental_merge_runs_off_message_writer_thread(self, db, monkeypatch):
+        db._FTS_MERGE_EVERY_N_WRITES = 1
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_merge():
+            started.set()
+            assert release.wait(1.0)
+            return True
+
+        monkeypatch.setattr(db, "_try_merge_fts", blocked_merge)
+        db.create_session(session_id="s1", source="cli")
+        before = time.monotonic()
+        db.append_message(session_id="s1", role="user", content="non blocking")
+        elapsed = time.monotonic() - before
+
+        assert started.wait(1.0)
+        assert elapsed < 0.10
+        assert db._fts_maintenance_thread is not None
+        release.set()
+        assert db._wait_for_fts_maintenance(1.0)
         assert db._fts_write_count == 0
 
 
