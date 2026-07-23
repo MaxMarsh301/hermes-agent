@@ -206,6 +206,38 @@ async def test_session_runtime_status_prefers_matching_config_override_over_mode
 
 
 @pytest.mark.asyncio
+async def test_session_runtime_status_applies_config_override_through_public_model_alias(
+    adapter, session_db, monkeypatch,
+):
+    """A public API alias must not bypass the configured context cap."""
+    session_id = session_db.create_session("runtime-capped-alias", "api_server", model="gpt-5.6-sol")
+    session_db.append_message(session_id, "user", "estimate this alias-backed conversation")
+    session_db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        ('{"api_session_overrides":{"model":"hermes-agent"}}', session_id),
+    )
+    session_db._conn.commit()
+    adapter._model_name = "hermes-agent"
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.6-sol")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "gpt-5.6-sol", "context_length": 272_000}},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *args, **kwargs: 1_050_000,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        payload = await (await cli.get(f"/api/sessions/{session_id}/runtime-status")).json()
+
+    assert payload["configuredModel"] == "hermes-agent"
+    assert payload["effectiveModel"] == "gpt-5.6-sol"
+    assert payload["contextLimitTokens"] == 272_000
+
+
+@pytest.mark.asyncio
 async def test_session_runtime_status_does_not_apply_configured_cap_to_fallback_model(
     adapter, session_db, monkeypatch,
 ):

@@ -3035,7 +3035,7 @@ class APIServerAdapter(BasePlatformAdapter):
         context_limit = getattr(compressor, "context_length", None) if compressor is not None else None
         if self._runtime_status_positive_context_length(context_limit) is None:
             context_limit = await self._runtime_status_context_limit(
-                effective_model, configured_model, config, runtime,
+                effective_model, configured_effective, config, runtime,
             )
         if isinstance(measured_context, int) and measured_context > 0:
             context_used = measured_context
