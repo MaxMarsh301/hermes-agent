@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -18,6 +19,47 @@ def load_plugin():
     spec=importlib.util.spec_from_file_location(name, ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
     module=importlib.util.module_from_spec(spec); sys.modules[name]=module; spec.loader.exec_module(module)
     return module
+
+
+def test_resolver_schema_and_handler_follow_registry_contract(monkeypatch):
+    plugin = load_plugin()
+    resolver = sys.modules[plugin.__name__ + ".resolver_tool"]
+    from tools.registry import ToolRegistry
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, config):
+            captured["config"] = config
+
+        async def resolve(self, payload):
+            captured["payload"] = payload
+            return {"status": "resolved", "reference": payload["reference"]}
+
+    monkeypatch.setattr(resolver.AntonConfig, "from_env", lambda: object())
+    monkeypatch.setattr(resolver, "AntonGatewayClient", FakeClient)
+
+    registry = ToolRegistry()
+    registry.register(
+        name="anton_resolve",
+        toolset="anton-gateway",
+        schema=resolver.SCHEMA,
+        handler=resolver.anton_resolve,
+        is_async=True,
+    )
+
+    definition = registry.get_definitions({"anton_resolve"})[0]["function"]
+    assert definition["name"] == "anton_resolve"
+    assert definition["parameters"]["required"] == ["reference"]
+    assert "reference" in definition["parameters"]["properties"]
+
+    reference = "anton:project_3f22faeb07d9479c98faf9bc00e0a8dd/conversation_4fe94550afb24d2ca70e39b1f06d1a89"
+    raw_result = registry.dispatch("anton_resolve", {"reference": reference})
+    assert isinstance(raw_result, str)
+    result = json.loads(raw_result)
+    assert result == {"status": "resolved", "reference": reference}
+    assert captured["payload"] == {"reference": reference, "options": {}}
+
 
 def test_explicit_target_is_strict_and_does_not_need_home(monkeypatch):
     plugin=load_plugin()
