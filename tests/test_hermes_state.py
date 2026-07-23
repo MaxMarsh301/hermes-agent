@@ -4726,39 +4726,63 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
-        calls = {"n": 0}
-        real_optimize = db.optimize_fts
+    def test_message_commits_trigger_bounded_merge_on_exact_cadence(self, db, monkeypatch):
+        """Only committed message mutations count toward incremental FTS merge."""
+        db._FTS_MERGE_EVERY_N_WRITES = 2
+        calls = []
+        monkeypatch.setattr(db, "_try_merge_fts", lambda: calls.append(True) or True)
 
-        def _counting_optimize():
-            calls["n"] += 1
-            return real_optimize()
-
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
-        # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
+        # Generic writes must not schedule FTS maintenance.
         db.create_session(session_id="s1", source="cli")
-        for i in range(9):
-            db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls["n"] == 2
-        # The auto-merge is layout-only: search is unaffected.
-        assert len(db.search_messages("needle")) == 9
+        db.set_meta("non-message", "write")
+        assert calls == []
 
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
+        db.append_message(session_id="s1", role="user", content="needle one")
+        assert calls == []
+        db.append_message(session_id="s1", role="user", content="needle two")
+        assert calls == [True]
+        assert db._fts_write_count == 0
+        assert len(db.search_messages("needle")) == 2
 
-        def _boom():
-            raise sqlite3.OperationalError("simulated optimize failure")
-
-        monkeypatch.setattr(db, "optimize_fts", _boom)
-        db.create_session(session_id="s1", source="cli")  # write #1
-        # write #2 trips the cadence; the swallowed failure must not propagate.
+    def test_incremental_merge_failure_keeps_committed_write_due_for_retry(self, db, monkeypatch):
+        """A busy/error maintenance pass never rolls back user data and stays due."""
+        db._FTS_MERGE_EVERY_N_WRITES = 1
+        calls = []
+        monkeypatch.setattr(db, "_try_merge_fts", lambda: calls.append(True) and False)
+        db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
+        assert calls == [True]
+        assert db._fts_write_count == 1
+
+        monkeypatch.setattr(db, "_try_merge_fts", lambda: True)
+        db.append_message(session_id="s1", role="user", content="retry merge")
+        assert db._fts_write_count == 0
+
+    def test_incremental_merge_skips_missing_trigram_table(self, db):
+        """The base FTS index is merged when optional trigram is absent."""
+        with db._lock:
+            for trig in (
+                "messages_fts_trigram_insert",
+                "messages_fts_trigram_delete",
+                "messages_fts_trigram_update",
+            ):
+                db._conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        assert db._try_merge_fts() is True
+
+    def test_incremental_merge_prevents_concurrent_maintenance(self, db):
+        """A held maintenance lock leaves the cadence due rather than overlapping."""
+        db._FTS_MERGE_EVERY_N_WRITES = 1
+        db.create_session(session_id="s1", source="cli")
+        assert db._fts_maintenance_lock.acquire(blocking=False)
+        try:
+            db.append_message(session_id="s1", role="user", content="deferred")
+            assert db._fts_write_count == 1
+        finally:
+            db._fts_maintenance_lock.release()
+        db.append_message(session_id="s1", role="user", content="runs now")
+        assert db._fts_write_count == 0
 
 
 class TestAutoMaintenance:

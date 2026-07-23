@@ -27,7 +27,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 logger = logging.getLogger(__name__)
 
@@ -1058,16 +1058,14 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
-    # Merge fragmented FTS5 segments every N successful writes. The message
-    # triggers append one segment per insert; left unmaintained these grow
-    # into tens of thousands of segments, so every MATCH must scan them all
-    # and every insert pays a growing automerge cost — which lengthens the
-    # write-lock hold time and starves competing writers (gateway + cron
-    # processes share one state.db), surfacing as "database is locked".
-    # 'optimize' is a no-op once the index is already merged, so an idle DB
-    # pays almost nothing; the cadence is deliberately coarse so the one-off
-    # merge cost is amortised far below the checkpoint cadence.
-    _OPTIMIZE_EVERY_N_WRITES = 1000
+    # Merge fragmented FTS5 segments after this many committed message-table
+    # mutations. Generic state writes (run/progress/meta/session updates) do
+    # not grow the message FTS indexes and must never trigger this work.
+    _FTS_MERGE_EVERY_N_WRITES = 25
+    # FTS5's merge command bounds each maintenance pass by pages per table.
+    # Keep SQLite's built-in automerge setting untouched; this is only a small
+    # additional, explicit pass for a busy long-lived SessionDB.
+    _FTS_MERGE_PAGES_PER_TABLE = 128
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
@@ -1083,7 +1081,9 @@ class SessionDB:
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        self._fts_maintenance_lock = threading.Lock()
         self._write_count = 0
+        self._fts_write_count = 0
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
@@ -1316,7 +1316,12 @@ class SessionDB:
                 self._warn_fts5_unavailable(exc)
             return False
 
-    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _execute_write(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        fts_mutated: Union[bool, Callable[[T], bool]] = False,
+    ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
         *fn* receives the connection and should perform INSERT/UPDATE/DELETE
@@ -1349,8 +1354,14 @@ class SessionDB:
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
-                if self._write_count % self._OPTIMIZE_EVERY_N_WRITES == 0:
-                    self._try_optimize_fts()
+                changed_fts = fts_mutated(result) if callable(fts_mutated) else fts_mutated
+                if changed_fts:
+                    self._fts_write_count += 1
+                    if self._fts_write_count >= self._FTS_MERGE_EVERY_N_WRITES:
+                        # Reset only after a completed pass. Busy/errors leave
+                        # maintenance due for the next message mutation.
+                        if self._try_merge_fts():
+                            self._fts_write_count = 0
                 return result
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -1400,21 +1411,45 @@ class SessionDB:
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
-    def _try_optimize_fts(self) -> None:
-        """Best-effort FTS5 segment merge. Never raises.
+    def _try_merge_fts(self) -> bool:
+        """Run one bounded, best-effort FTS5 merge pass; never raise.
 
-        Runs on the ``_OPTIMIZE_EVERY_N_WRITES`` cadence from the write hot
-        path (off the lock — ``optimize_fts`` re-acquires ``self._lock``
-        itself, mirroring ``_try_wal_checkpoint``). ``read_only`` connections
-        never reach the write path, so this is implicitly skipped for them.
-        Once the index is merged the 'optimize' command is close to free, so
-        the steady-state cost is negligible; the expensive case is only the
-        first merge of a long-neglected index.
+        This synchronous path deliberately has no background thread: SessionDB
+        owns a sqlite connection and cannot safely outlive callers. The caller
+        invokes it only after commit and outside ``_lock``. A separate lock
+        prevents two maintenance passes on the same SessionDB from overlapping.
         """
+        if not self._fts_maintenance_lock.acquire(blocking=False):
+            logger.debug("FTS incremental merge skipped: maintenance already running")
+            return False
+        started = time.monotonic()
+        merged = 0
         try:
-            self.optimize_fts()
-        except Exception:
-            pass  # Best effort — never fatal.
+            with self._lock:
+                for table in self._FTS_TABLES:
+                    if not self._fts_table_exists(table):
+                        continue
+                    self._conn.execute(
+                        f"INSERT INTO {table}({table}, rank) VALUES('merge', ?)",
+                        (self._FTS_MERGE_PAGES_PER_TABLE,),
+                    )
+                    merged += 1
+            logger.debug(
+                "FTS incremental merge completed: tables=%d pages_per_table=%d duration_ms=%.1f",
+                merged,
+                self._FTS_MERGE_PAGES_PER_TABLE,
+                (time.monotonic() - started) * 1000,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "FTS incremental merge failed: error_type=%s duration_ms=%.1f",
+                type(exc).__name__,
+                (time.monotonic() - started) * 1000,
+            )
+            return False
+        finally:
+            self._fts_maintenance_lock.release()
 
     def close(self):
         """Close the database connection.
@@ -4163,7 +4198,7 @@ class SessionDB:
                 )
             return msg_id
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, fts_mutated=True)
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
@@ -4278,7 +4313,7 @@ class SessionDB:
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
-            conn.execute(
+            deleted = conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
             )
@@ -4293,8 +4328,9 @@ class SessionDB:
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            return bool(deleted.rowcount or total_messages)
 
-        self._execute_write(_do)
+        self._execute_write(_do, fts_mutated=lambda changed: changed)
 
     def restore_session_transcript(
         self,
@@ -4314,7 +4350,7 @@ class SessionDB:
         """
 
         def _do(conn):
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            deleted = conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             inserted, tool_calls = self._insert_message_rows(conn, session_id, messages)
             conn.execute(
                 """UPDATE sessions
@@ -4322,8 +4358,9 @@ class SessionDB:
                    WHERE id=?""",
                 (inserted, tool_calls, ended_at, end_reason, session_id),
             )
+            return bool(deleted.rowcount or inserted)
 
-        self._execute_write(_do)
+        self._execute_write(_do, fts_mutated=lambda changed: changed)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -4373,7 +4410,7 @@ class SessionDB:
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them.
-            conn.execute(
+            archived = conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
@@ -4387,9 +4424,10 @@ class SessionDB:
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (inserted, tool_calls_total, session_id),
             )
-            return inserted
+            return inserted, bool(archived.rowcount or inserted)
 
-        return self._execute_write(_do)
+        inserted, _ = self._execute_write(_do, fts_mutated=lambda result: result[1])
+        return inserted
 
 
     # ── Durable public API context ownership ──────────────────────────────
@@ -5438,7 +5476,7 @@ class SessionDB:
             )
             return ids
 
-        rewound = self._execute_write(_do)
+        rewound = self._execute_write(_do, fts_mutated=lambda ids: bool(ids))
 
         # 2) Compute new head id (largest still-active row id in session).
         with self._lock:
@@ -5476,7 +5514,7 @@ class SessionDB:
                 )
             return len(ids)
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, fts_mutated=lambda count: bool(count))
 
     def list_recent_user_messages(
         self,
@@ -6481,7 +6519,10 @@ class SessionDB:
                 "errors": errors,
             }
 
+        message_rows_imported = {"count": 0}
+
         def _do(conn):
+            message_rows_imported["count"] = 0
             imported_ids: List[str] = []
             skipped_ids: List[str] = []
             parent_updates: List[tuple[str, str]] = []
@@ -6584,6 +6625,7 @@ class SessionDB:
                     session_id,
                     sanitized_messages,
                 )
+                message_rows_imported["count"] += total_messages
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                     (total_messages, total_tool_calls, session_id),
@@ -6642,19 +6684,22 @@ class SessionDB:
                 "errors": [],
             }
 
-        return self._execute_write(_do)
+        return self._execute_write(
+            _do, fts_mutated=lambda _result: bool(message_rows_imported["count"])
+        )
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
-            conn.execute(
+            deleted = conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
-        self._execute_write(_do)
+            return bool(deleted.rowcount)
+        self._execute_write(_do, fts_mutated=lambda changed: changed)
 
     @staticmethod
     def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
@@ -6699,8 +6744,10 @@ class SessionDB:
         session. Returns True if the session was found and deleted.
         """
         removed_delegate_ids: List[str] = []
+        message_rows_removed = {"value": False}
 
         def _do(conn):
+            message_rows_removed["value"] = False
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
             )
@@ -6713,11 +6760,14 @@ class SessionDB:
                 "WHERE parent_session_id = ?",
                 (session_id,),
             )
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            deleted_messages = conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            message_rows_removed["value"] = bool(deleted_messages.rowcount)
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
 
-        deleted = self._execute_write(_do)
+        deleted = self._execute_write(
+            _do, fts_mutated=lambda _result: message_rows_removed["value"]
+        )
         if deleted:
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
@@ -6806,8 +6856,10 @@ class SessionDB:
 
         removed_ids: list[str] = []
         removed_delegate_ids: list[str] = []
+        message_rows_removed = {"value": False}
 
         def _do(conn):
+            message_rows_removed["value"] = False
             placeholders = ",".join("?" * len(unique_ids))
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
@@ -6831,10 +6883,11 @@ class SessionDB:
                 f"WHERE parent_session_id IN ({existing_placeholders})",
                 existing,
             )
-            conn.execute(
+            deleted_messages = conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
                 existing,
             )
+            message_rows_removed["value"] = bool(deleted_messages.rowcount)
             conn.execute(
                 f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
                 existing,
@@ -6842,7 +6895,9 @@ class SessionDB:
             removed_ids.extend(existing)
             return len(existing)
 
-        count = self._execute_write(_do)
+        count = self._execute_write(
+            _do, fts_mutated=lambda _result: message_rows_removed["value"]
+        )
         for sid in removed_delegate_ids:
             self._remove_session_files(sessions_dir, sid)
         for sid in removed_ids:
@@ -7158,8 +7213,10 @@ class SessionDB:
             filters["started_before"] = time.time() - (older_than_days * 86400)
         where, where_params = self._prune_filter_where(source=source, **filters)
         removed_ids: list[str] = []
+        message_rows_removed = {"value": False}
 
         def _do(conn):
+            message_rows_removed["value"] = False
             cursor = conn.execute(
                 f"SELECT s.id FROM sessions s WHERE {where}", where_params
             )
@@ -7177,12 +7234,17 @@ class SessionDB:
             )
 
             for sid in session_ids:
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                deleted_messages = conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                message_rows_removed["value"] = (
+                    message_rows_removed["value"] or bool(deleted_messages.rowcount)
+                )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
 
-        count = self._execute_write(_do)
+        count = self._execute_write(
+            _do, fts_mutated=lambda _result: message_rows_removed["value"]
+        )
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
