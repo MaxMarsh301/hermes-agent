@@ -92,6 +92,31 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_bounds_wedged_shutdown_notifications(monkeypatch):
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    never = asyncio.Event()
+
+    async def hang_forever():
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            # Simulate a wedged transport that suppresses cancellation.
+            await never.wait()
+
+    runner._notify_active_sessions_of_shutdown = hang_forever
+    monkeypatch.setattr(gateway_run, "_SHUTDOWN_NOTIFICATION_TIMEOUT_SECS_DEFAULT", 0.01)
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await asyncio.wait_for(runner.stop(), timeout=1.0)
+
+    adapter.disconnect.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+    never.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_drains_running_agents_before_disconnect():
     runner, adapter = make_restart_runner()
     # Opt into a grace window (the default is 0 = interrupt immediately).

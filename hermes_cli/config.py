@@ -2307,7 +2307,7 @@ DEFAULT_CONFIG = {
         # budget still applies.
         "max_summary_chars": 24000,
 
-        "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
+        "child_timeout_seconds": 1500,  # hard wall-clock cap per child agent (25 minutes)
                                      # = no timeout: children fail only from real errors
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds

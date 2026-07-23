@@ -228,6 +228,31 @@ class TestDumpSubagentTimeoutDiagnostic:
         assert result is None or Path(result).exists()
 
 
+class TestChildTimeoutConfiguration:
+    def test_default_is_1500_seconds(self, monkeypatch):
+        from tools import delegate_tool
+
+        monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+        monkeypatch.delenv("DELEGATION_CHILD_TIMEOUT_SECONDS", raising=False)
+        assert delegate_tool._get_child_timeout() == 1500.0
+
+    def test_explicit_zero_disables_hard_timeout(self, monkeypatch):
+        from tools import delegate_tool
+
+        monkeypatch.setattr(
+            delegate_tool, "_load_config", lambda: {"child_timeout_seconds": 0}
+        )
+        assert delegate_tool._get_child_timeout() is None
+
+    def test_configured_1500_is_preserved(self, monkeypatch):
+        from tools import delegate_tool
+
+        monkeypatch.setattr(
+            delegate_tool, "_load_config", lambda: {"child_timeout_seconds": 1500}
+        )
+        assert delegate_tool._get_child_timeout() == 1500.0
+
+
 # ── _run_single_child timeout branch wiring ───────────────────────────
 
 class TestRunSingleChildTimeoutDump:

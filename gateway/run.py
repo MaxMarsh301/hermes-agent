@@ -68,6 +68,7 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_SHUTDOWN_NOTIFICATION_TIMEOUT_SECS_DEFAULT = 10.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -8363,7 +8364,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
+            # Notifications are best-effort and must never consume the service
+            # manager's entire stop budget when a platform transport is wedged.
+            notification_task = asyncio.create_task(
+                self._notify_active_sessions_of_shutdown()
+            )
+            done, _ = await asyncio.wait(
+                {notification_task},
+                timeout=_SHUTDOWN_NOTIFICATION_TIMEOUT_SECS_DEFAULT,
+            )
+            if notification_task not in done:
+                notification_task.cancel()
+
+                def consume_notification_result(task: asyncio.Task) -> None:
+                    if task.cancelled():
+                        return
+                    try:
+                        task.exception()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                notification_task.add_done_callback(consume_notification_result)
+                logger.warning(
+                    "Shutdown notifications exceeded %.1fs; continuing drain",
+                    _SHUTDOWN_NOTIFICATION_TIMEOUT_SECS_DEFAULT,
+                )
+            else:
+                try:
+                    await notification_task
+                except Exception:
+                    logger.warning("Shutdown notifications failed; continuing drain", exc_info=True)
             logger.info(
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),

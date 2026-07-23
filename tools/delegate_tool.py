@@ -428,17 +428,10 @@ def _get_child_timeout() -> Optional[float]:
     Returns the number of seconds a single child agent is allowed to run
     before being cut off, or ``None`` when no wall-clock cap applies.
 
-    Default: ``None`` (no timeout). Subagents doing legitimate heavy work
-    (deep code review, large research fan-outs, slow reasoning models) were
-    routinely killed mid-task by the old blanket cap even though they were
-    making steady progress. Failures should come from what the child is
-    actually doing — API errors, tool errors, iteration budget — not from a
-    generic delegation-level stopwatch. Stuck-child protection is handled
-    separately by the heartbeat staleness monitor, which stops refreshing
-    parent activity so the gateway inactivity timeout can fire.
-
-    Set ``delegation.child_timeout_seconds`` to a positive number to opt back
-    in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
+    Default: 1500 seconds. This is a hard wall-clock safety cap; the independent
+    heartbeat staleness monitor still refreshes parent activity only while a
+    child is making observable progress. Set a positive number to override the
+    cap (floor 30 s); ``0`` or a negative value explicitly disables it.
     """
     cfg = _load_config()
     val = cfg.get("child_timeout_seconds")
@@ -448,7 +441,7 @@ def _get_child_timeout() -> Optional[float]:
         except (TypeError, ValueError):
             logger.warning(
                 "delegation.child_timeout_seconds=%r is not a valid number; "
-                "using default (no timeout)",
+                "using default (1500 seconds)",
                 val,
             )
         else:
@@ -598,10 +591,9 @@ _SUMMARY_HEADROOM_FRACTION = 0.5
 _MIN_SUMMARY_CHARS = 2000
 # No default wall-clock cap on child agents: legitimate heavy subagent work
 # (deep reviews, research fan-outs, slow reasoning models) was being killed
-# mid-task. Errors should come from what the child actually does; stuck-child
-# detection lives in the heartbeat staleness monitor below. Users can opt back
-# in via delegation.child_timeout_seconds.
-DEFAULT_CHILD_TIMEOUT: Optional[float] = None
+# Hard wall-clock timeout defaults to 1500 seconds. The heartbeat staleness
+# monitor below remains independent and stops refreshing a wedged child.
+DEFAULT_CHILD_TIMEOUT: Optional[float] = 1500.0
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -1923,9 +1915,9 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
+        # Run child with the configured hard timeout (1500 seconds by default).
+        # The heartbeat staleness monitor independently prevents a wedged child
+        # from keeping the parent alive forever.
         child_timeout = _get_child_timeout()
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
