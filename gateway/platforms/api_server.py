@@ -1486,6 +1486,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_stop_watchdogs: Dict[str, "asyncio.TimerHandle"] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Public subagent callbacks can be much noisier than the Runs control
+        # plane.  Keep only tiny reducer state, keyed by opaque run/agent IDs.
+        self._public_agent_progress: Dict[tuple[str, str], Dict[str, Any]] = {}
+        # Persistence is deliberately independent of event chatter.  These
+        # tails serialize writes per run without ever blocking the aiohttp loop.
+        self._run_persist_tails: Dict[str, "asyncio.Task"] = {}
+        self._run_persisted_fingerprints: Dict[str, tuple[Any, ...]] = {}
+        self._run_persisted_at: Dict[str, float] = {}
         # Logical-session domains serialize history load -> agent turn -> pointer
         # reconciliation. SQLite remains the cross-restart source of truth.
         self._context_locks: Dict[str, asyncio.Lock] = {}
@@ -6136,6 +6144,53 @@ class APIServerAdapter(BasePlatformAdapter):
     _ANTON_SYNTHESIS_LEASE_SECONDS = 15.0
     _ANTON_SYNTHESIS_HEARTBEAT_SECONDS = 5.0
     _RUN_SSE_WRITE_TIMEOUT = 15  # stalled clients cannot pin an SSE handler
+    _RUN_PUBLIC_PROGRESS_INTERVAL = 1.0
+    _RUN_PERSIST_HEARTBEAT_SECONDS = 30.0
+
+    def _schedule_run_persistence(self, run_id: str, current: Dict[str, Any], *, now: float) -> None:
+        """Persist semantic run state off-loop, preserving per-run write order."""
+        logical_id = current.get("logical_session_id")
+        if not logical_id:
+            return
+        fingerprint = (
+            current.get("status"), logical_id,
+            current.get("effective_session_id") or logical_id,
+            int(current.get("context_revision", 0)),
+        )
+        terminal = current.get("status") in self._RUN_TERMINAL_STATUSES
+        if fingerprint == self._run_persisted_fingerprints.get(run_id):
+            if terminal or now - self._run_persisted_at.get(run_id, 0) < self._RUN_PERSIST_HEARTBEAT_SECONDS:
+                return
+        self._run_persisted_fingerprints[run_id] = fingerprint
+        self._run_persisted_at[run_id] = now
+        db = self._ensure_session_db()
+        if db is None:
+            return
+
+        async def _write(previous: Optional["asyncio.Task"]) -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except Exception:
+                    pass
+            try:
+                await asyncio.to_thread(
+                    db.save_api_run, run_id, str(logical_id),
+                    str(current.get("effective_session_id") or logical_id),
+                    int(current.get("context_revision", 0)), str(current.get("status")),
+                )
+            except Exception:
+                logger.debug("Could not persist public run status", exc_info=True)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Callback threads cannot run SQLite work; the next loop-side
+            # semantic transition/heartbeat will persist the snapshot.
+            return
+        previous = self._run_persist_tails.get(run_id)
+        task = loop.create_task(_write(previous))
+        self._run_persist_tails[run_id] = task
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -6170,12 +6225,7 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
-        db = self._ensure_session_db()
-        if db is not None and current.get("logical_session_id"):
-            try:
-                db.save_api_run(run_id, current["logical_session_id"], current.get("effective_session_id") or current["logical_session_id"], int(current.get("context_revision", 0)), status)
-            except Exception:
-                logger.debug("Could not persist public run status", exc_info=True)
+        self._schedule_run_persistence(run_id, current, now=now)
         return current
 
     def _terminalize_stopped_run(self, run_id: str, *, reason: str) -> bool:
@@ -6422,18 +6472,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 # per-agent projection below can cross the Runs boundary.
                 event = self._public_background_event(run_id, event_type, kwargs)
                 if event is not None:
+                    key = (run_id, event["agent_id"])
+                    if event_type == "subagent.start":
+                        self._public_agent_progress[key] = {
+                            "last_emitted": time.monotonic(),
+                            "tool_count": event.get("tool_count", 0),
+                        }
+                    elif event_type == "subagent.complete":
+                        # A terminal lifecycle event is never throttled and
+                        # carries the latest observed aggregate before reducer
+                        # state is released.
+                        state = self._public_agent_progress.pop(key, {})
+                        if isinstance(state.get("tool_count"), int):
+                            event["tool_count"] = max(event.get("tool_count", 0), state["tool_count"])
+                    else:
+                        state = self._public_agent_progress.setdefault(key, {"last_emitted": 0.0, "tool_count": 0})
+                        if isinstance(event.get("tool_count"), int):
+                            state["tool_count"] = max(state["tool_count"], event["tool_count"])
+                        now_mono = time.monotonic()
+                        if now_mono - state["last_emitted"] < self._RUN_PUBLIC_PROGRESS_INTERVAL:
+                            return
+                        state["last_emitted"] = now_mono
+                        event["tool_count"] = state["tool_count"]
                     _push(event)
             elif event_type == "reasoning.available":
-                # Native reasoning is private.  A bounded, static liveness
-                # notice is enough for Runs clients and cannot contain CoT.
-                if last_was_notice:
-                    return
-                _push({
-                    "event": "progress.notice",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "kind": "thinking",
-                })
+                # Native reasoning is private and intentionally has no public
+                # progress representation. This avoids callback storms and CoT
+                # disclosure alike.
+                return
             # Thinking and native reasoning payloads are intentionally not forwarded.
             # Subagent lifecycle is forwarded above as a redacted background.updated
             # event; it deliberately contains no child context or tool details.
@@ -8574,6 +8640,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._run_approval_ids.pop(run_id, None)
+                self._run_persisted_fingerprints.pop(run_id, None)
+                self._run_persisted_at.pop(run_id, None)
+                self._public_agent_progress = {
+                    key: value for key, value in self._public_agent_progress.items() if key[0] != run_id
+                }
                 self._stopping_run_ids.discard(run_id)
                 clarification_ids = self._run_clarification_ids.pop(run_id, set())
                 if clarification_ids:
@@ -8594,6 +8665,12 @@ class APIServerAdapter(BasePlatformAdapter):
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
             self._run_emitters.pop(run_id, None)
+            self._run_persisted_fingerprints.pop(run_id, None)
+            self._run_persisted_at.pop(run_id, None)
+            self._run_persist_tails.pop(run_id, None)
+            self._public_agent_progress = {
+                key: value for key, value in self._public_agent_progress.items() if key[0] != run_id
+            }
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

@@ -1056,13 +1056,8 @@ class TestRunPublicToolLifecycle:
         callback("reasoning.available", "_thinking", "SECOND SECRET", None)
         await asyncio.sleep(0)
 
-        event = adapter._run_streams[run_id].get_nowait()
-        assert event["event"] == "progress.notice"
-        assert event["kind"] == "thinking"
-        assert "message" not in event
+        # Thinking is private and must not create public progress chatter.
         assert adapter._run_streams[run_id].empty()
-        assert "SECRET" not in repr(event)
-        assert "text" not in event and "preview" not in event
 
     @pytest.mark.asyncio
     async def test_runs_wires_interim_callback_and_ignores_already_streamed(self, adapter):
@@ -1886,3 +1881,53 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+@pytest.mark.asyncio
+async def test_subagent_callback_storm_is_coalesced_and_terminal_is_preserved(adapter):
+    run_id = "run-storm"
+    adapter._run_streams[run_id] = asyncio.Queue()
+    adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+    callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+    base = {"subagent_id": "child-a", "task_index": 0, "task_count": 1}
+    callback("subagent.start", **base)
+    for count in range(10_000):
+        callback("subagent.tool", **base, tool_count=count)
+    callback("subagent.complete", **base, tool_count=10_000, status="completed")
+    await asyncio.sleep(0)
+
+    events = []
+    while not adapter._run_streams[run_id].empty():
+        events.append(adapter._run_streams[run_id].get_nowait())
+    assert [event["status"] for event in events] == ["running", "completed"]
+    assert events[-1]["tool_count"] == 10_000
+    assert adapter._public_agent_progress == {}
+
+
+@pytest.mark.asyncio
+async def test_run_persistence_ignores_event_chatter_and_heartbeats(adapter, monkeypatch):
+    class DB:
+        def __init__(self):
+            self.calls = []
+        def save_api_run(self, *args):
+            self.calls.append(args)
+
+    db = DB()
+    adapter._session_db = db
+    clock = [100.0]
+    monkeypatch.setattr("gateway.platforms.api_server.time.time", lambda: clock[0])
+    adapter._set_run_status("run-persist", "running", logical_session_id="logical", effective_session_id="effective")
+    for _ in range(20):
+        adapter._set_run_status("run-persist", "running", last_event="tool.completed")
+    await adapter._run_persist_tails["run-persist"]
+    assert len(db.calls) == 1
+    clock[0] += 29
+    adapter._set_run_status("run-persist", "running", last_event="tool.completed")
+    assert len(db.calls) == 1
+    clock[0] += 1
+    adapter._set_run_status("run-persist", "running", last_event="tool.completed")
+    await adapter._run_persist_tails["run-persist"]
+    assert len(db.calls) == 2
+    adapter._set_run_status("run-persist", "completed")
+    await adapter._run_persist_tails["run-persist"]
+    assert len(db.calls) == 3
