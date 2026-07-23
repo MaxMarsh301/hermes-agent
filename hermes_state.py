@@ -1086,6 +1086,7 @@ class SessionDB:
         self._fts_maintenance_thread: Optional[threading.Thread] = None
         self._fts_maintenance_due = False
         self._fts_closed = False
+        self._fts_maintenance_stop = threading.Event()
         self._write_count = 0
         self._fts_write_count = 0
         self._fts_enabled = False
@@ -1471,6 +1472,7 @@ class SessionDB:
 
     def _run_fts_maintenance(self) -> None:
         """Run bounded merge passes off caller and HTTP threads."""
+        retry_delay = 0.05
         try:
             while True:
                 with self._fts_maintenance_state_lock:
@@ -1482,7 +1484,11 @@ class SessionDB:
                     with self._fts_maintenance_state_lock:
                         if not self._fts_closed:
                             self._fts_maintenance_due = True
-                    return
+                    if self._fts_maintenance_stop.wait(retry_delay):
+                        return
+                    retry_delay = min(retry_delay * 2, 5.0)
+                    continue
+                retry_delay = 0.05
                 with self._fts_maintenance_state_lock:
                     self._fts_write_count = max(0, self._fts_write_count - covered_writes)
                     self._fts_maintenance_due = (
@@ -1511,6 +1517,7 @@ class SessionDB:
         with self._fts_maintenance_state_lock:
             self._fts_closed = True
             self._fts_maintenance_due = False
+            self._fts_maintenance_stop.set()
         if not self._wait_for_fts_maintenance(timeout=5.0):
             logger.warning("FTS maintenance worker did not stop before close timeout")
         with self._lock:

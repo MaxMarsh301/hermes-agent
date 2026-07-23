@@ -4746,21 +4746,21 @@ class TestOptimizeFts:
         assert db._fts_write_count == 0
         assert len(db.search_messages("needle")) == 2
 
-    def test_incremental_merge_failure_keeps_committed_write_due_for_retry(self, db, monkeypatch):
-        """A busy/error maintenance pass never rolls back user data and stays due."""
+    def test_incremental_merge_failure_retries_without_another_write(self, db, monkeypatch):
+        """A busy/error pass retries in the worker without rolling back user data."""
         db._FTS_MERGE_EVERY_N_WRITES = 1
         calls = []
-        monkeypatch.setattr(db, "_try_merge_fts", lambda: calls.append(True) and False)
+
+        def fail_once_then_succeed():
+            calls.append(True)
+            return len(calls) >= 2
+
+        monkeypatch.setattr(db, "_try_merge_fts", fail_once_then_succeed)
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="still persists")
         assert db._wait_for_fts_maintenance(1.0)
         assert len(db.get_messages("s1")) == 1
-        assert calls == [True]
-        assert db._fts_write_count == 1
-
-        monkeypatch.setattr(db, "_try_merge_fts", lambda: True)
-        db.append_message(session_id="s1", role="user", content="retry merge")
-        assert db._wait_for_fts_maintenance(1.0)
+        assert calls == [True, True]
         assert db._fts_write_count == 0
 
     def test_incremental_merge_skips_missing_trigram_table(self, db):
@@ -4782,11 +4782,10 @@ class TestOptimizeFts:
         assert db._fts_maintenance_lock.acquire(blocking=False)
         try:
             db.append_message(session_id="s1", role="user", content="deferred")
-            assert db._wait_for_fts_maintenance(1.0)
+            time.sleep(0.05)
             assert db._fts_write_count == 1
         finally:
             db._fts_maintenance_lock.release()
-        db.append_message(session_id="s1", role="user", content="runs now")
         assert db._wait_for_fts_maintenance(1.0)
         assert db._fts_write_count == 0
 
